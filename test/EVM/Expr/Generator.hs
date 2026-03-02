@@ -9,6 +9,7 @@ import Data.DoubleWord (Word128, Word256, Word160, fromHiAndLo)
 import Data.Proxy
 import Data.Text (Text)
 import Data.Text qualified as T (pack)
+import Data.List.NonEmpty qualified as NE
 import Data.Vector qualified as V
 import Data.Word (Word8, Word64)
 import GHC.TypeLits
@@ -36,7 +37,7 @@ instance Arbitrary GenWriteStorageLoad where
 
 genStorage :: Int -> Gen (Expr Storage)
 genStorage 0 = oneof
-  [ AbstractStore <$> arbitrary <*> (pure Nothing)
+  [ AbstractStore <$> arbitrary <*> (pure Nothing) <*> (pure Nothing)
   , ConcreteStore <$> resize 5 arbitrary
   ]
 genStorage sz = SStore <$> genStorageKey <*> val <*> subStore
@@ -310,7 +311,7 @@ genEContract sz = do
   n <- arbitrary
   s <- genStorage sz
   ts <- genStorage sz
-  pure $ C {code=c, storage=s, tStorage=ts, balance=b, nonce=n}
+  pure $ C {code=c, storage= NE.singleton s, tStorage= NE.singleton ts, balance= NE.singleton b, nonce=n}
 
 instance Arbitrary (Expr End) where
   arbitrary = sized genEnd
@@ -512,7 +513,7 @@ genStorageWrites :: Gen (Expr Storage)
 genStorageWrites = do
   toSlot <- genSlot
   val <- genLit (maxBound :: W256)
-  store <- frequency [ (3, pure $ AbstractStore (SymAddr "") Nothing)
+  store <- frequency [ (3, pure $ AbstractStore (SymAddr "") Nothing Nothing)
                      , (2, genStorageWrites)
                      ]
   pure $ SStore toSlot val store
@@ -565,7 +566,7 @@ genEnd 0 = oneof
   ]
 genEnd sz = oneof
   [ Failure <$> subProp <*> (pure mempty) <*> (fmap Revert subBuf)
-  , Success <$> subProp <*> (pure mempty) <*> subBuf <*> arbitrary
+  , Success <$> subProp <*> (pure mempty) <*> subBuf <*> arbitrary <*> (pure [])
   -- TODO Partial
   ]
   where

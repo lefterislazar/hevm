@@ -5,6 +5,7 @@ module Main where
 import Test.Tasty
 import Test.Tasty.HUnit
 
+import Data.List.NonEmpty qualified as NE
 import Data.Maybe
 import Data.Map qualified as Map
 import Data.Text (Text)
@@ -89,7 +90,7 @@ tests = testGroup "rpc"
         postVm <- withSolvers Z3 1 Nothing defMemLimit $ \solvers ->
           Stepper.interpret (oracle solvers (Just sess) testRpcInfo) vm Stepper.runFully
         let
-          wethStore = (fromJust $ Map.lookup (LitAddr 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2) postVm.env.contracts).storage
+          wethStore = NE.head (fromJust $ Map.lookup (LitAddr 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2) postVm.env.contracts).storage
           wethStore' = case wethStore of
             ConcreteStore s -> s
             _ -> internalError "Expecting concrete store"

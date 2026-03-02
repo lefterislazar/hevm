@@ -24,6 +24,7 @@ import Data.Aeson.Types qualified as JSON
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as Lazy
 import Data.List (isPrefixOf)
+import Data.List.NonEmpty qualified as NE
 import Data.Map (Map)
 import Data.Map qualified as Map
 import Data.Maybe (fromJust, fromMaybe, isNothing)
@@ -77,15 +78,15 @@ asBCContract c = BlockchainContract code nonce balance storage
       (RuntimeCode (ConcreteRuntimeCode bs)) -> ByteStringS bs
       _ -> internalError "Expected concrete contract"
     nonce = fromJust c.nonce
-    balance = forceLit (c.balance)
-    storage = fromConcrete c.storage
+    balance = forceLit (NE.head c.balance)
+    storage = fromConcrete (NE.head c.storage)
 
 makeContract :: BlockchainContract -> Contract
 makeContract (BlockchainContract (ByteStringS code) nonce balance storage) =
     initialContract (RuntimeCode (ConcreteRuntimeCode code))
       & set #nonce    (Just nonce)
-      & set #balance  (Lit balance)
-      & set #storage (ConcreteStore storage)
+      & set (#balance % ix 0)  (Lit balance)
+      & set (#storage % ix 0) (ConcreteStore storage)
       & set #origStorage (ConcreteStore storage)
 
 type BlockchainContracts = Map Addr BlockchainContract
@@ -256,10 +257,10 @@ applyWithdrawals ws vm = foldl applyWithdrawal vm ws
     creditBalance weiAmount Nothing =
       -- Create new account with just the withdrawal balance
       Just $ (EVM.initialContract (RuntimeCode (ConcreteRuntimeCode "")))
-        { balance = weiAmount }
+        { balance = NE.singleton weiAmount }
     creditBalance (Lit weiAmount) (Just c) =
       -- Add to existing balance
-      Just $ c { balance = Lit (forceLit c.balance + weiAmount) }
+      Just $ c { balance = NE.singleton $ Lit (forceLit (NE.head c.balance) + weiAmount) }
     creditBalance _ (Just c) = Just c  -- shouldn't happen in concrete execution
 
 checkExpectation :: Case -> VM Concrete -> Maybe (IO String)
@@ -328,10 +329,11 @@ fromConcrete (ConcreteStore s) = s
 fromConcrete s = internalError $ "unexpected abstract store: " <> show s
 
 clearZeroStorage :: Contract -> Contract
-clearZeroStorage c = case c.storage of
-  ConcreteStore m -> let store = Map.filter (/= 0) m
-                     in set #storage (ConcreteStore store) c
-  _ -> internalError "Internal Error: unexpected abstract store"
+clearZeroStorage c = c { storage = fmap clearStore c.storage }
+  where
+    clearStore :: Expr Storage -> Expr Storage
+    clearStore (ConcreteStore m) = ConcreteStore (Map.filter (/= 0) m)
+    clearStore _ = internalError "Internal Error: unexpected abstract store"
 
 clearStorage :: BlockchainContract -> BlockchainContract
 clearStorage c = c { storage = mempty}

@@ -42,6 +42,7 @@ import Data.DoubleWord.TH
 import Data.Foldable (Foldable(..))
 import Data.Map (Map)
 import Data.Maybe (fromMaybe)
+import qualified Data.List.NonEmpty as NE
 import Data.Set (Set)
 import Data.Sequence (Seq)
 import Data.Sequence qualified as Seq
@@ -230,7 +231,7 @@ data Expr (a :: EType) where
 
   Partial        :: [Prop] -> TraceContext -> PartialExec -> Expr End
   Failure        :: [Prop] -> TraceContext -> EvmError -> Expr End
-  Success        :: [Prop] -> TraceContext -> Expr Buf -> Map (Expr EAddr) (Expr EContract) -> Expr End
+  Success        :: [Prop] -> TraceContext -> Expr Buf -> Map (Expr EAddr) (Expr EContract) -> [Interaction] -> Expr End
 
   -- integers
 
@@ -294,8 +295,8 @@ data Expr (a :: EType) where
   TxValue        :: Expr EWord
 
   -- frame context
-
-  Balance        :: Expr EAddr -> Expr EWord
+  
+  Balance        :: Expr EAddr -> Maybe Int -> Expr EWord
 
   Gas            :: Text               -- prefix needed to distinguish during equivalence checking
                  -> Int                -- fresh gas variable
@@ -323,9 +324,9 @@ data Expr (a :: EType) where
   -- from the full constructor defined in the VM state
   C ::
     { code     :: ContractCode
-    , storage  :: Expr Storage
-    , tStorage :: Expr Storage
-    , balance  :: Expr EWord
+    , storage  :: NE.NonEmpty (Expr Storage)
+    , tStorage :: NE.NonEmpty (Expr Storage)
+    , balance  :: NE.NonEmpty (Expr EWord)
     , nonce    :: Maybe W64
     } -> Expr EContract
 
@@ -342,6 +343,7 @@ data Expr (a :: EType) where
 
   ConcreteStore  :: (Map W256 W256) -> Expr Storage
   AbstractStore  :: Expr EAddr -- which contract is this store for?
+                 -> Maybe Int  -- how many resets to abstract have preceded this store
                  -> Maybe W256 -- which logical store does this refer to? (e.g. solidity mappings / arrays)
                  -> Expr Storage
 
@@ -589,6 +591,12 @@ evmErrToString = \case
   PrecompileFailure       -> "Precompile failure"
   err                     -> "hevm error: " <> show err
 
+-- | Interaction with external world for isolated execution
+data Interaction
+  = CreateContract { tag :: Int, value :: Expr EWord, bytecode :: ContractCode } -- store info about success? see possible failures
+  | Call           { tag :: Int, address :: Expr EWord, value :: Expr EWord, calldata :: Expr Buf, abi :: Maybe W256, retOffset :: Expr EWord, retSize :: Expr EWord }
+  | StaticCall     { tag :: Int, address :: Expr EWord, calldata :: Expr Buf, abi :: Maybe W256, retOffset :: Expr EWord, retSize :: Expr EWord }
+  deriving (Show, Eq, Ord)
 
 -- | Sometimes we can only partially execute a given program
 data PartialExec
@@ -695,7 +703,7 @@ data VM (t :: VMType) = VM
   , burned         :: !(Gas t)
   , iterations     :: Map CodeLocation (Int, [Expr EWord])
   -- ^ how many times we've visited a loc, and what the contents of the stack were when we were there last
-  , constraints    :: [Prop]
+  , constraints    :: NE.NonEmpty [Prop]
   , config         :: RuntimeConfig
   , forks          :: Seq ForkState
   , currentFork    :: Int
@@ -705,6 +713,7 @@ data VM (t :: VMType) = VM
   , freshVar       :: Int
   -- ^ used to generate fresh symbolic variable names for overapproximations
   --   during symbolic execution. See e.g. OpStaticcall
+  , interactions   :: [Interaction]
   , exploreDepth   :: Int
   , keccakPreImgs  :: Set (ByteString, W256)
   , mergeState     :: MergeState
@@ -865,10 +874,10 @@ data Block = Block
 -- | Full contract state
 data Contract = Contract
   { code        :: ContractCode
-  , storage     :: Expr Storage
-  , tStorage    :: Expr Storage
+  , storage     :: NE.NonEmpty (Expr Storage)
+  , tStorage    :: NE.NonEmpty (Expr Storage)
   , origStorage :: Expr Storage
-  , balance     :: Expr EWord
+  , balance     :: NE.NonEmpty (Expr EWord)
   , nonce       :: Maybe W64
   , codehash    :: Expr EWord
   , opIxMap     :: VS.Vector Int -- ^ map from byte index to op index
@@ -1146,7 +1155,7 @@ data SMTCex = SMTCex
   { vars :: Map (Expr EWord) W256
   , addrs :: Map (Expr EAddr) Addr
   , buffers :: Map (Expr Buf) BufModel
-  , store :: Map (Expr EAddr) (Map W256 W256)
+  , store :: Map (Expr EAddr, Maybe Int) (Map W256 W256)
   , blockContext :: Map (Expr EWord) W256
   , txContext :: Map (Expr EWord) W256
   }

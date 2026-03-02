@@ -222,7 +222,7 @@ abstractVM cd contractCode maybepre create = do
   let precond = case maybepre of
                 Nothing -> []
                 Just p -> [p vm]
-  pure $ vm & over #constraints (<> precond)
+  pure $ vm & over (#constraints % ix 0) (<> precond)
 
 -- Creates symbolic VM with empty storage, not symbolic storage like loadSymVM
 loadEmptySymVM
@@ -708,9 +708,9 @@ runExpr = do
   vm <- Stepper.runFully
   let traces = TraceContext (Zipper.toForest vm.traces) vm.env.contracts vm.labels
   pure $ case vm.result of
-    Just (VMSuccess buf) -> Success vm.constraints traces buf (fmap toEContract vm.env.contracts)
-    Just (VMFailure e)   -> Failure vm.constraints traces e
-    Just (Unfinished p)  -> Partial vm.constraints traces p
+    Just (VMSuccess buf) -> Success (concat $ NE.toList vm.constraints) traces buf (fmap toEContract vm.env.contracts) vm.interactions
+    Just (VMFailure e)   -> Failure (concat $ NE.toList vm.constraints) traces e
+    Just (Unfinished p)  -> Partial (concat $ NE.toList vm.constraints) traces p
     _ -> internalError "vm in intermediate state after call to runFully"
 
 toEContract :: Contract -> Expr EContract
@@ -732,14 +732,14 @@ reachable solvers e = catMaybes <$> mapM go e
 -- | Extract constraints stored in Expr End nodes
 extractProps :: Expr End -> [Prop]
 extractProps = \case
-  Success asserts _ _ _ -> asserts
+  Success asserts _ _ _ _ -> asserts
   Failure asserts _ _ -> asserts
   Partial asserts _ _ -> asserts
   GVar _ -> internalError "cannot extract props from a GVar"
 
 extractEndStates :: Expr End -> Map (Expr EAddr) (Expr EContract)
 extractEndStates = \case
-  Success _ _ _ contr -> contr
+  Success _ _ _ contr _ -> contr
   Failure {} -> mempty
   Partial  {} -> mempty
   GVar _ -> internalError "cannot extract props from a GVar"
@@ -859,8 +859,10 @@ verifyInputsWithHandler solvers opts fetcher preState post cexHandler = do
 expandCex :: VM Symbolic -> SMTCex -> SMTCex
 expandCex prestate c = c { store = Map.union c.store concretePreStore }
   where
-    concretePreStore = Map.mapMaybe (Expr.maybeConcStoreSimp . (.storage))
-                     . Map.filter (\v -> Expr.containsNode isConcreteStore v.storage)
+    concretePreStore = Map.fromList
+                     . concatMap (\(a,b) -> mapMaybe (\s -> (((a, Expr.getAbstrs s),) <$> Expr.maybeConcStoreSimp s)) $ NE.filter (Expr.containsNode isConcreteStore) b.storage)
+                     . Map.toList
+                     -- . Map.filter (\v -> Expr.containsNode isConcreteStore v.storage)
                      $ (prestate.env.contracts)
     isConcreteStore = \case
       ConcreteStore _ -> True
@@ -1005,7 +1007,7 @@ equivalenceCheck' solvers sess branchesA branchesB create = do
     resultsDiffer aEnd bEnd = do
       let deployText :: String = if create then "Undeployed contracts. " else "Deployed contracts. "
       case (aEnd, bEnd) of
-        (Success aProps _ aOut aState, Success bProps _ bOut bState) ->
+        (Success aProps _ aOut aState _, Success bProps _ bOut bState _) -> --TODO: change this
           case (aOut == bOut, aState == bState, create) of
             (True, True, _) -> pure (Nothing, mempty)
             (_, _, True) -> do
@@ -1030,11 +1032,11 @@ equivalenceCheck' solvers sess branchesA branchesB create = do
                   deployText <> "Both end in Failure but different EVM error." <>
                   "\nA err: " <> T.unpack (formatError a) <>
                   "\nB err: " <> T.unpack (formatError b)), mempty)
-        ((Failure _ _ a), (Success _ _ b _)) -> pure (Just (PBool True,
+        ((Failure _ _ a), (Success _ _ b _ _)) -> pure (Just (PBool True,
           deployText <> "Failure vs Success end states" <>
           "\nA err: " <> T.unpack (formatError a) <>
           "\nB ret: " <> T.unpack (formatExpr b)), mempty)
-        ((Success _ _ a _), (Failure _ _ b)) -> pure (Just (PBool True,
+        ((Success _ _ a _ _), (Failure _ _ b)) -> pure (Just (PBool True,
           deployText <> "Success vs Failure end states" <>
           "\nA ret: " <> T.unpack (formatExpr a) <>
           "\nB err: " <> T.unpack (formatError b)), mempty)
@@ -1088,12 +1090,12 @@ equivalenceCheck' solvers sess branchesA branchesB create = do
 
     contractsDiffer :: Expr EContract -> Expr EContract -> Prop
     contractsDiffer ac bc = let
-        balsDiffer = case (ac.balance, bc.balance) of
+        balsDiffer = por . NE.toList $ flip fmap (NE.zip ac.balance bc.balance) $ \case
           (Lit ab, Lit bb) -> PBool $ ab /= bb
           (ab, bb) -> if ab == bb then PBool False else ab ./= bb
         -- TODO: is this sound? do we need a more sophisticated nonce representation?
         noncesDiffer = PBool (ac.nonce /= bc.nonce)
-        storesDiffer = case (ac.storage, bc.storage) of
+        storesDiffer = por . NE.toList $ flip fmap (NE.zip ac.storage bc.storage) $ \case
           (ConcreteStore as, ConcreteStore bs) | not (as == Map.empty || bs == Map.empty) -> PBool $ as /= bs
           (as, bs) -> if as == bs then PBool False else as ./= bs
       in balsDiffer .|| storesDiffer .|| noncesDiffer
@@ -1203,7 +1205,7 @@ formatCex cd sig m@(SMTCex _ addrs _ store blockContext txContext) = T.unlines $
       where
         go :: Expr EWord -> W256 -> Bool
         go (TxValue) _ = True
-        go (Balance {}) _ = internalError "TODO: BALANCE"
+        go (Balance {}) _ = True
         go (Gas {}) _ = internalError "TODO: Gas"
         go _ _ = False
 
@@ -1350,16 +1352,16 @@ subBufs model b = Map.foldlWithKey subBuf (Right b) model
           Just k -> forceFlattened k
           Nothing -> Left $ show buf
 
-subStores :: Map (Expr EAddr) (Map W256 W256) -> Expr a -> Expr a
+subStores :: Map (Expr EAddr, Maybe Int) (Map W256 W256) -> Expr a -> Expr a
 subStores model b = Map.foldlWithKey subStore b model
   where
-    subStore :: Expr a -> Expr EAddr -> Map W256 W256 -> Expr a
+    subStore :: Expr a -> (Expr EAddr, Maybe Int) -> Map W256 W256 -> Expr a
     subStore x var val = mapExpr go x
       where
         go :: Expr a -> Expr a
         go = \case
-          v@(AbstractStore a _)
-            -> if a == var
+          v@(AbstractStore a r _)
+            -> if (a,r) == var
                then ConcreteStore val
                else v
           e -> e

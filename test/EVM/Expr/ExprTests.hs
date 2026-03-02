@@ -55,7 +55,7 @@ storageTests = testGroup "Storage tests"
   [
     testCase "read-from-sstore" $ assertEqual errorMsg
         (Lit 0xab)
-        (Expr.readStorage' (Lit 0x0) (SStore (Lit 0x0) (Lit 0xab) (AbstractStore (LitAddr 0x0) Nothing)))
+        (Expr.readStorage' (Lit 0x0) (SStore (Lit 0x0) (Lit 0xab) (AbstractStore (LitAddr 0x0) Nothing Nothing)))
     , testCase "read-from-concrete" $ assertEqual errorMsg
         (Lit 0xab)
         (Expr.readStorage' (Lit 0x0) (ConcreteStore $ Map.fromList [(0x0, 0xab)]))
@@ -283,9 +283,9 @@ basicSimplificationTests = testGroup "Basic simplification tests"
       assertEqual "" (LitByte 0) simp
   , testCase "storage-slot-single" $ do
       -- this tests that "" and "0"x32 is not equivalent in Keccak
-      let x = SLoad (Add (Keccak (ConcreteBuf "")) (Lit 1)) (SStore (Keccak (ConcreteBuf "\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL")) (Lit 0) (AbstractStore (SymAddr "stuff") Nothing))
+      let x = SLoad (Add (Keccak (ConcreteBuf "")) (Lit 1)) (SStore (Keccak (ConcreteBuf "\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL\NUL")) (Lit 0) (AbstractStore (SymAddr "stuff") Nothing Nothing))
       let simplified = Expr.simplify x
-      let expected = SLoad (Add (Lit 1) (Keccak (ConcreteBuf ""))) (AbstractStore (SymAddr "stuff") Nothing)
+      let expected = SLoad (Add (Lit 1) (Keccak (ConcreteBuf ""))) (AbstractStore (SymAddr "stuff") Nothing Nothing)
       assertEqual "" expected simplified
   , testCase "word-eq-bug" $ do
       -- This test is actually OK because the simplified takes into account that it's impossible to find a
@@ -306,7 +306,7 @@ basicSimplificationTests = testGroup "Basic simplification tests"
       assertEqual "Must order eqbyte params" b (EqByte (ReadByte (Lit 1) (AbstractBuf "a")) (ReadByte (Lit 1) (AbstractBuf "b")))
   , testCase "prop-simp-expr" $ do
       let
-        successPath props = Success props mempty (ConcreteBuf "") mempty
+        successPath props = Success props mempty (ConcreteBuf "") mempty mempty
         a = successPath [PEq (Add (Lit 1) (Lit 2)) (Sub (Lit 4) (Lit 1))]
         b = Expr.simplify a
       assertEqual "Must simplify down" (successPath []) b
@@ -924,7 +924,7 @@ concretizationTests = testGroup "Concretization tests"
       let simp = Expr.simplifyProp $ PEq (AbstractBuf "b") (AbstractBuf "b")
       assertEqual "PEq AbstractBuf self-equal" (PBool True) simp
   , testCase "conc-peq-abstractstore-self" $ do
-      let simp = Expr.simplifyProp $ PEq (AbstractStore (LitAddr 0x1) Nothing) (AbstractStore (LitAddr 0x1) Nothing)
+      let simp = Expr.simplifyProp $ PEq (AbstractStore (LitAddr 0x1) Nothing Nothing) (AbstractStore (LitAddr 0x1) Nothing Nothing)
       assertEqual "PEq AbstractStore self-equal" (PBool True) simp
   -- Other simplifications over Props
   , testCase "conc-plt-true" $ do

@@ -28,7 +28,7 @@ instance Monoid SMT2 where
   mempty = SMT2 mempty mempty mempty
 
 
-newtype StorageReads = StorageReads (Map (Expr EAddr, Maybe W256) (Set (Expr EWord)))
+newtype StorageReads = StorageReads (Map (Expr EAddr, Maybe Int, Maybe W256) (Set (Expr EWord)))
   deriving (Eq, Show)
 
 instance Semigroup StorageReads where

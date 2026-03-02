@@ -59,6 +59,7 @@ import Data.Char qualified as Char
 import Data.DoubleWord (signedWord)
 import Data.Foldable (toList)
 import Data.List (isPrefixOf, sort)
+import Data.List.NonEmpty qualified as NE
 import Data.Map qualified as Map
 import Data.Maybe (catMaybes, fromMaybe, listToMaybe)
 import Data.Text (Text, pack, unpack, intercalate, dropEnd, splitOn)
@@ -442,11 +443,11 @@ prettyError = \case
 
 prettyvmresult :: Expr End -> String
 prettyvmresult (Failure _ _ (Revert (ConcreteBuf ""))) = "Revert"
-prettyvmresult (Success _ _ (ConcreteBuf msg) _) =
+prettyvmresult (Success _ _ (ConcreteBuf msg) _ _) =
   if BS.null msg
   then "Stop"
   else "Return: " <> show (ByteStringS msg)
-prettyvmresult (Success _ _ _ _) =
+prettyvmresult (Success _ _ _ _ __) =
   "Return: <symbolic>"
 prettyvmresult (Failure _ _ err) = prettyError err
 prettyvmresult (Partial _ _ p) = T.unpack $ formatPartial p
@@ -554,13 +555,14 @@ formatExpr = go
       (GVar v) -> "(GVar " <> T.pack (show v) <> ")"
       LitByte w -> T.pack $ show w
 
-      Success asserts _ buf store -> T.unlines
+      Success asserts _ buf store interactions -> T.unlines
         [ "(Success"
         , indent 2 $ T.unlines
           [ "Data:" , indent 2 $ formatExpr buf
           , ""
           , "State:", formatState store
           , "Assertions:", indent 2 . T.unlines $ fmap formatProp asserts
+          , "Interactions:", indent 2 . T.unlines $ fmap (T.pack . show) interactions
           ]
         , ")"
         ]
@@ -662,7 +664,11 @@ formatExpr = go
       e@(Gas {}) -> "(" <> T.pack (show e) <> ")"
 
       BlockHash a -> fmt "BlockHash" [a]
-      Balance a -> fmt "Balance" [a]
+      Balance a b -> T.unlines
+          [ "(" <> "Balance"
+          , indent 2 $ T.unlines [ formatExpr a , T.pack $ show b ]
+          , ")"
+          ]
       CodeSize a -> fmt "CodeSize" [a]
       CodeHash a -> fmt "CodeHash" [a]
 
@@ -730,11 +736,11 @@ formatExpr = go
           [ "code:"
           , indent 2 $ formatCode code
           , "storage:"
-          , indent 2 $ formatExpr store
+          , indent 2 $ T.unlines $ fmap formatExpr $ NE.toList store
           , "tStorage:"
-          , indent 2 $ formatExpr tStore
+          , indent 2 $ T.unlines $ fmap formatExpr $ NE.toList tStore
           , "balance:"
-          , indent 2 $ formatExpr bal
+          , indent 2 $ T.unlines $ fmap formatExpr $ NE.toList bal
           , "nonce:"
           , indent 2 $ formatNonce nonce
           ]
@@ -764,8 +770,8 @@ formatExpr = go
           ]
         , ")"
         ]
-      AbstractStore a idx ->
-        "(AbstractStore " <> formatExpr a <> " " <> T.pack (show idx) <> ")"
+      AbstractStore a rsts idx ->
+        "(AbstractStore " <> formatExpr a <> " " <> T.pack (show rsts) <> " " <> T.pack (show idx) <> ")"
       ConcreteStore s -> if null s
         then "(ConcreteStore <empty>)"
         else T.unlines

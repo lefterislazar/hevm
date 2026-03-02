@@ -35,6 +35,7 @@ import Data.ByteString.Internal (c2w)
 import Data.ByteString.Lazy qualified as BSLazy
 import Data.Decimal (DecimalRaw(..))
 import Data.Foldable (Foldable(..), toList)
+import Data.List.NonEmpty qualified as NE
 import Data.Map (Map)
 import Data.Map qualified as Map
 import Data.Maybe
@@ -148,7 +149,7 @@ initializeUnitTest opts theContract = do
 
   Stepper.evm $ do
     -- Give a balance to the test target
-    #env % #contracts % ix addr % #balance %= (`Expr.add` (Lit opts.testParams.balanceCreate))
+    #env % #contracts % ix addr % #balance % ix 0 %= (`Expr.add` (Lit opts.testParams.balanceCreate))
 
     -- call setUp(), if it exists, to initialize the test contract
     let theAbi = theContract.abiMap
@@ -238,12 +239,12 @@ dsTestFailedSym :: Map (Expr 'EAddr) (Expr EContract) -> VM t -> Prop
 dsTestFailedSym store vm =
   let testContract = fromMaybe (internalError "test contract not found in state") (Map.lookup vm.state.contract store)
   in case Map.lookup cheatCode store of
-    Just cheatContract -> Expr.readStorage' (Lit 0x6661696c65640000000000000000000000000000000000000000000000000000) cheatContract.storage .== Lit 1
-    Nothing -> And (Expr.readStorage' (Lit 0) testContract.storage) (Lit 2) .== Lit 2
+    Just cheatContract -> Expr.readStorage' (Lit 0x6661696c65640000000000000000000000000000000000000000000000000000) (NE.head cheatContract.storage) .== Lit 1
+    Nothing -> And (Expr.readStorage' (Lit 0) (NE.head testContract.storage)) (Lit 2) .== Lit 2
 
 dsTestFailedConc :: Map (Expr 'EAddr) Contract -> Bool
 dsTestFailedConc store = case Map.lookup cheatCode store of
-  Just cheatContract -> Expr.readStorage' (Lit 0x6661696c65640000000000000000000000000000000000000000000000000000) cheatContract.storage == Lit 1
+  Just cheatContract -> Expr.readStorage' (Lit 0x6661696c65640000000000000000000000000000000000000000000000000000) (NE.head cheatContract.storage) == Lit 1
   Nothing -> internalError "dsTestFailedConc: expected a cheatCode in the store"
 
 -- Define the thread spawner for symbolic tests
@@ -259,10 +260,10 @@ symRun opts@UnitTestOptions{..} vm sig@(Sig testName types) sourceCache = do
     let
         postcondition = curry $ case shouldFail of
           True -> \(_, post) -> case post of
-            Success _ _ _ store -> if opts.checkFailBit then (dsTestFailedSym store vm) else PBool False
+            Success _ _ _ store _ -> if opts.checkFailBit then (dsTestFailedSym store vm) else PBool False
             _ -> PBool True
           False -> \(_, post) -> case post of
-            Success _ _ _ store -> if opts.checkFailBit then PNeg (dsTestFailedSym store vm) else PBool True
+            Success _ _ _ store _ -> if opts.checkFailBit then PNeg (dsTestFailedSym store vm) else PBool True
             Failure _ _ (UnrecognizedOpcode 0xfe) -> PBool False
             Failure _ _ (Revert msg) -> case msg of
               ConcreteBuf b ->
@@ -391,7 +392,7 @@ symFailure UnitTestOptions {..} testName cd types failure = do
   pure $ mconcat [ indentLines 3 $ mkMsg conf failure ]
   where
       showRes = \case
-        Success _ _ _ _ -> if "proveFail" `isPrefixOf` testName
+        Success _ _ _ _ _ -> if "proveFail" `isPrefixOf` testName
                            then "Successful execution"
                            else "Failed: Test Assertion Violation"
         res ->
@@ -517,11 +518,11 @@ makeTxCall params (cd, cdProps) = do
   assign (#tx % #isCreate) False
   execState (loadContract params.address) <$> get >>= put
   assign (#state % #calldata) cd
-  #constraints %= (<> cdProps)
+  #constraints %= \(a NE.:| b) -> (a <> cdProps) NE.:| b
   assign (#state % #caller) params.caller
   assign (#state % #gas) (toGas params.gasCall)
   origin <- fromMaybe (initialContract (RuntimeCode (ConcreteRuntimeCode ""))) <$> use (#env % #contracts % at params.origin)
-  let insufficientBal = maybe False (\b -> b < params.gasprice * (into params.gasCall)) (maybeLitWordSimp origin.balance)
+  let insufficientBal = maybe False (\b -> b < params.gasprice * (into params.gasCall)) (maybeLitWordSimp (NE.head origin.balance))
   when insufficientBal $ internalError "insufficient balance for gas cost"
   vm <- get
   put $ initTx vm
@@ -551,7 +552,7 @@ initialUnitTestVm (UnitTestOptions {..}) theContract = do
   let creator =
         initialContract (RuntimeCode (ConcreteRuntimeCode ""))
           & set #nonce (Just 1)
-          & set #balance (Lit testParams.balanceCreate)
+          & set (#balance % ix 0) (Lit testParams.balanceCreate)
   pure $ vm & set (#env % #contracts % at (LitAddr ethrunAddress)) (Just creator)
 
 -- | Build a SrcLookup callback that resolves (address, pc) to source location info

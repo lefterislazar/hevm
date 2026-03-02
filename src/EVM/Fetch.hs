@@ -350,7 +350,7 @@ makeContractFromRPC :: RPCContract -> Contract
 makeContractFromRPC (RPCContract (ByteStringS code) nonce balance) =
     initialContract (RuntimeCode (ConcreteRuntimeCode code))
       & set #nonce    (Just nonce)
-      & set #balance  (Lit balance)
+      & set (#balance % ix 0)  (Lit balance)
       & set #external True
 
 -- Needed for Echidna only

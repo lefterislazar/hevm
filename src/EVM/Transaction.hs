@@ -301,7 +301,7 @@ setupTx :: Expr EAddr -> Expr EAddr -> W256 -> Word64 -> Map (Expr EAddr) Contra
 setupTx origin coinbase gasPrice gasLimit prestate =
   let gasCost = gasPrice * (into gasLimit)
   in (Map.adjust ((over #nonce   (fmap ((+) 1)))
-               . (over #balance (`Expr.sub` (Lit gasCost)))) origin)
+               . (over (#balance % ix 0) (`Expr.sub` (Lit gasCost)))) origin)
     . touchAccount origin
     . touchAccount coinbase $ prestate
 
@@ -326,8 +326,8 @@ initTx vm =
     -- For collision: don't transfer value, don't create contract
     initState = if hasCollision
       then touchAccount toAddr preState
-      else ((Map.adjust (over #balance (`Expr.sub` value))) origin)
-         . (Map.adjust (over #balance (Expr.add value))) toAddr
+      else ((Map.adjust (over (#balance % ix 0) (`Expr.sub` value))) origin)
+         . (Map.adjust (over (#balance % ix 0) (Expr.add value))) toAddr
          . (if creation
             then Map.insert toAddr (toContract & (set #balance oldBalance))
             else touchAccount toAddr)

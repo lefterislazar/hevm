@@ -45,6 +45,7 @@ import Data.Either.Extra (maybeToEither)
 import Data.Foldable (toList, Foldable(..))
 import Data.List (find, isPrefixOf)
 import Data.List.Split (splitOn)
+import Data.List.NonEmpty qualified as NE
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe, fromJust, isJust, isNothing, mapMaybe)
@@ -187,7 +188,7 @@ makeVm o = do
       }
     , env = env
     , burned = initialGas
-    , constraints = snd o.calldata
+    , constraints = NE.singleton $ snd o.calldata
     , iterations = mempty
     , config = RuntimeConfig
       { allowFFI = o.allowFFI
@@ -199,6 +200,7 @@ makeVm o = do
     , labels = mempty
     , osEnv = mempty
     , freshVar = 0
+    , interactions = []
     , exploreDepth = 0
     , keccakPreImgs = fromList []
     , pathsVisited = mempty
@@ -239,9 +241,9 @@ setEIP4788Storage o vm = do
         timestampIdx = Expr.mod o.timestamp (Lit historyBufferLength)
         rootIdx = Expr.add timestampIdx (Lit historyBufferLength)
         storage =
-          Expr.writeStorage timestampIdx o.timestamp .
+          (Expr.writeStorage timestampIdx o.timestamp .
           Expr.writeStorage rootIdx (Lit o.beaconRoot) $
-          beaconRootsContract.storage
+          NE.head beaconRootsContract.storage) NE.:| NE.tail beaconRootsContract.storage
       vm {
         env = vm.env {
           contracts = Map.insert beaconRootsAddress
@@ -260,7 +262,7 @@ setEIP2935Storage o vm = do
       let
         historyBufferLength = 8191
         slotIdx = Expr.mod (Expr.sub o.number (Lit 1)) (Lit historyBufferLength)
-        storage = Expr.writeStorage slotIdx (Lit o.parentHash) historyContract.storage
+        storage = (Expr.writeStorage slotIdx (Lit o.parentHash) $ NE.head historyContract.storage) NE.:| NE.tail historyContract.storage
       vm {
         env = vm.env {
           contracts = Map.insert historyStorageAddress
@@ -274,10 +276,10 @@ setEIP2935Storage o vm = do
 unknownContract :: Expr EAddr -> Contract
 unknownContract addr = Contract
   { code        = UnknownCode addr
-  , storage     = AbstractStore addr Nothing
-  , tStorage    = AbstractStore addr Nothing
-  , origStorage = AbstractStore addr Nothing
-  , balance     = Balance addr
+  , storage     = NE.singleton $ AbstractStore addr Nothing Nothing
+  , tStorage    = NE.singleton $ AbstractStore addr Nothing Nothing
+  , origStorage = AbstractStore addr Nothing Nothing
+  , balance     = NE.singleton $ Balance addr Nothing
   , nonce       = Nothing
   , codehash    = hashcode (UnknownCode addr)
   , opIxMap     = mempty
@@ -289,10 +291,10 @@ unknownContract addr = Contract
 abstractContract :: ContractCode -> Expr EAddr -> Contract
 abstractContract code addr = Contract
   { code        = code
-  , storage     = AbstractStore addr Nothing
-  , tStorage    = AbstractStore addr Nothing
-  , origStorage = AbstractStore addr Nothing
-  , balance     = Balance addr
+  , storage     = NE.singleton $ AbstractStore addr Nothing Nothing
+  , tStorage    = NE.singleton $ AbstractStore addr Nothing Nothing
+  , origStorage = AbstractStore addr Nothing Nothing
+  , balance     = NE.singleton $ Balance addr Nothing
   , nonce       = if isCreation code then Just 1 else Just 0
   , codehash    = hashcode code
   , opIxMap     = mkOpIxMap code
@@ -308,10 +310,10 @@ emptyContract = initialContract (RuntimeCode (ConcreteRuntimeCode ""))
 initialContract :: ContractCode -> Contract
 initialContract code = Contract
   { code        = code
-  , storage     = ConcreteStore mempty
-  , tStorage    = ConcreteStore mempty
+  , storage     = NE.singleton $ ConcreteStore mempty
+  , tStorage    = NE.singleton $ ConcreteStore mempty
   , origStorage = ConcreteStore mempty
-  , balance     = Lit 0
+  , balance     = NE.singleton $ Lit 0
   , nonce       = if isCreation code then Just 1 else Just 0
   , codehash    = hashcode code
   , opIxMap     = mkOpIxMap code
@@ -509,12 +511,12 @@ exec1 conf = do
 
         OpBalance -> {-# SCC "OpBalance" #-}
           case stk of
-            x:xs -> forceAddr x (freshVarFallback xs) $ \a ->
+            x:xs -> forceAddr x (freshVarFallback xs Nothing) $ \a ->
               accessAndBurn a $
-                fetchAccountWithFallback a (freshVarFallback xs) $ \c -> do
+                fetchAccountWithFallback a (freshVarFallback xs Nothing) $ \c -> do
                   next
                   assign' (#state % #stack) xs
-                  pushSym c.balance
+                  pushSym (NE.head c.balance)
             [] -> underrun
 
         OpOrigin -> {-# SCC "OpOrigin" #-}
@@ -568,9 +570,9 @@ exec1 conf = do
 
         OpExtcodesize -> {-# SCC "OpExtcodesize" #-}
           case stk of
-            x':xs -> forceAddr x' (freshVarFallback xs) $ \x -> do
+            x':xs -> forceAddr x' (freshVarFallback xs Nothing) $ \x -> do
               let impl = accessAndBurn x $
-                           fetchAccountWithFallback x (freshVarFallback xs) $ \c -> do
+                           fetchAccountWithFallback x (freshVarFallback xs Nothing) $ \c -> do
                              next
                              assign' (#state % #stack) xs
                              case view bytecode c of
@@ -627,9 +629,9 @@ exec1 conf = do
 
         OpExtcodehash -> {-# SCC "OpExtcodehash" #-}
           case stk of
-            x':xs -> forceAddr x' (freshVarFallback xs) $ \x ->
+            x':xs -> forceAddr x' (freshVarFallback xs Nothing) $ \x ->
               accessAndBurn x $ do
-                fetchAccountWithFallback x (freshVarFallback xs) $ \c -> do
+                fetchAccountWithFallback x (freshVarFallback xs Nothing) $ \c -> do
                    next
                    assign' (#state % #stack) xs
                    if accountEmpty c
@@ -683,7 +685,7 @@ exec1 conf = do
 
         OpSelfbalance -> {-# SCC "OpSelfbalance" #-}
           limitStack 1 . burn g_low $
-            next >> pushSym this.balance
+            next >> pushSym (NE.head this.balance)
 
         OpBaseFee -> {-# SCC "OpBaseFee" #-}
           limitStack 1 . burn g_base $
@@ -792,14 +794,14 @@ exec1 conf = do
 
                 symbolicRead :: EVM t () = if this.external
                   then accessStorage self x finalizeLoad
-                  else finalizeLoad $ Expr.readStorage' (Expr.concKeccakOnePass x) this.storage
+                  else finalizeLoad $ Expr.readStorage' (Expr.concKeccakOnePass x) $ NE.head this.storage
 
                 concreteRead :: EVM t () = do
                   acc <- accessStorageForGas self (forceLit x)
                   let cost = if acc then g_warm_storage_read else g_cold_sload
                   burn cost $ if this.external
                     then accessStorage self x finalizeLoad
-                    else finalizeLoad $ Lit $ accessConcreteStorage this.storage (forceLit x)
+                    else finalizeLoad $ Lit $ accessConcreteStorage (NE.head this.storage) (forceLit x)
               in whenSymbolicElse symbolicRead concreteRead
             _ -> underrun
 
@@ -811,12 +813,12 @@ exec1 conf = do
                 updateVMState :: EVM t () = do
                   next
                   assign' (#state % #stack) xs
-                  modifying (#env % #contracts % ix self % #storage) (writeStorage x new)
+                  modifying (#env % #contracts % ix self % #storage % ix 0) (writeStorage x new)
 
                 concreteSstore :: EVM t () = do
                   let
                     slot = forceLit x
-                    currentVal = accessConcreteStorage this.storage slot
+                    currentVal = accessConcreteStorage (NE.head this.storage) slot
                     newVal = forceLit new
                     originalVal = accessConcreteStorage this.origStorage slot
                   ensureGas g_callstipend $ do
@@ -857,7 +859,7 @@ exec1 conf = do
             x:new:xs ->
               burn g_sload $ do
                 next
-                modifying (#env % #contracts % ix self % #tStorage) (writeStorage x new)
+                modifying (#env % #contracts % ix self % #tStorage % ix 0) (writeStorage x new)
                 assign' (#state % #stack) xs
             _ -> underrun
 
@@ -965,8 +967,10 @@ exec1 conf = do
           case stk of
             xGas:xTo':xValue:xInOffset:xInSize:xOutOffset:xOutSize:xs ->
               branch conf.maxDepth (Expr.gt xValue (Lit 0)) $ \gt0 -> do
-                let addrFallback = if conf.promiseNoReent then const fallback
-                                   else unexpectedSymArgW "unable to determine a call target"
+                let addrFallback
+                      | conf.isolated = uninterpFallback
+                      | conf.promiseNoReent = const fallback
+                      | otherwise = unexpectedSymArgW "unable to determine a call target"
                 (if gt0 then notStatic else id) $
                   forceAddr xTo' addrFallback $ \xTo ->
                     case gasTryFrom xGas of
@@ -975,7 +979,7 @@ exec1 conf = do
                         overrideC <- use $ #state % #overrideCaller
                         let delegateFallback = if conf.promiseNoReent then const fallback
                                                else unknownCode
-                        delegateCall this gas xTo xTo xValue xInOffset xInSize xOutOffset xOutSize xs delegateFallback $
+                        delegateCall this gas xTo xTo xValue xInOffset xInSize xOutOffset xOutSize xs conf.isolated delegateFallback $
                           \callee -> do
                             let from' = fromMaybe self overrideC
                             zoom #state $ do
@@ -985,7 +989,8 @@ exec1 conf = do
                             touchAccount from'
                             touchAccount callee
                             transfer from' callee xValue
-              where fallback = freshBufFallback xs
+              where fallback = freshBufFallback xs Nothing
+                    uninterpFallback xto = uninterpCall this xto xValue xInOffset xInSize xOutOffset xOutSize xs
             _ -> underrun
 
         OpCallcode -> {-# SCC "OpCallcode" #-}
@@ -996,7 +1001,7 @@ exec1 conf = do
                   Left _ -> vmError IllegalOverflow
                   Right gas -> do
                     overrideC <- use $ #state % #overrideCaller
-                    delegateCall this gas xTo self xValue xInOffset xInSize xOutOffset xOutSize xs unknownCode $ \_ -> do
+                    delegateCall this gas xTo self xValue xInOffset xInSize xOutOffset xOutSize xs False unknownCode $ \_ -> do
                       zoom #state $ do
                         assign #callvalue xValue
                         assign #caller $ fromMaybe self overrideC
@@ -1045,7 +1050,7 @@ exec1 conf = do
                     Right gas ->
                       -- NOTE: we don't update overrideCaller in this case because
                       -- forge-std doesn't. see: https://github.com/foundry-rs/foundry/pull/8863
-                      delegateCall this gas xTo' self (Lit 0) xInOffset xInSize xOutOffset xOutSize xs unknownCode $
+                      delegateCall this gas xTo' self (Lit 0) xInOffset xInSize xOutOffset xOutSize xs False unknownCode $
                         \_ -> touchAccount self
             _ -> underrun
 
@@ -1081,7 +1086,7 @@ exec1 conf = do
                 Left _ -> vmError IllegalOverflow
                 Right gas -> do
                   overrideC <- use $ #state % #overrideCaller
-                  delegateCall this gas xTo' xTo' (Lit 0) xInOffset xInSize xOutOffset xOutSize xs (const fallback) $
+                  delegateCall this gas xTo' xTo' (Lit 0) xInOffset xInSize xOutOffset xOutSize xs conf.isolated (const fallback) $
                     \callee -> do
                       zoom #state $ do
                         assign #callvalue (Lit 0)
@@ -1091,7 +1096,7 @@ exec1 conf = do
                       touchAccount self
                       touchAccount callee
                 where
-                  fallback = freshBufFallback xs
+                  fallback = freshBufFallback xs Nothing
             _ -> underrun
 
         OpSelfdestruct -> {-# SCC "OpSelfdestruct" #-}
@@ -1104,7 +1109,7 @@ exec1 conf = do
                 let createdThisTr = self `member` cc
                 acc <- accessAccountForGas xTo
                 let cost = if acc then 0 else g_cold_account_access
-                    funds = this.balance
+                    funds = NE.head this.balance
                     recipientExists = accountExists xTo vm
                 branch conf.maxDepth (Expr.iszero $ Expr.eq funds (Lit 0)) $ \hasFunds -> do
                   let c_new = if (not recipientExists) && hasFunds
@@ -1118,8 +1123,8 @@ exec1 conf = do
                     if hasFunds
                     then fetchAccount xTo $ \_ -> do
                       when (createdThisTr || xTo /= self) $ do
-                        #env % #contracts % ix xTo % #balance %= (Expr.add funds)
-                        assign (#env % #contracts % ix self % #balance) (Lit 0)
+                        #env % #contracts % ix xTo % #balance % ix 0 %= (Expr.add funds)
+                        assign (#env % #contracts % ix self % #balance % ix 0) (Lit 0)
                       doStop
                     else
                       doStop
@@ -1138,7 +1143,7 @@ exec1 conf = do
 transfer :: (VMOps t, ?conf::Config) => Expr EAddr -> Expr EAddr -> Expr EWord -> EVM t ()
 transfer _ _ (Lit 0) = pure ()
 transfer src dst val = do
-  sb <- preuse $ #env % #contracts % ix src % #balance
+  sb <- preuse $ #env % #contracts % ix src % #balance % ix 0
   db <- preuse $ #env % #contracts % ix dst % #balance
   case (sb, db) of
     -- both sender and recipient in state
@@ -1146,8 +1151,8 @@ transfer src dst val = do
       branch (?conf).maxDepth (Expr.gt val srcBal) $ \case
         True -> vmError $ BalanceTooLow val srcBal
         False -> do
-          (#env % #contracts % ix src % #balance) %= (`Expr.sub` val)
-          (#env % #contracts % ix dst % #balance) %= (`Expr.add` val)
+          (#env % #contracts % ix src % #balance % ix 0) %= (`Expr.sub` val)
+          (#env % #contracts % ix dst % #balance % ix 0 ) %= (`Expr.add` val)
     -- sender not in state
     (Nothing, Just _) -> do
       case src of
@@ -1189,7 +1194,7 @@ callChecks this xGas xContext xTo xValue xInOffset xInSize xOutOffset xOutSize x
       availableGas <- use (#state % #gas)
       let recipientExists = accountExists xContext vm
       let from = fromMaybe vm.state.contract vm.state.overrideCaller
-      fromBal <- preuse $ #env % #contracts % ix from % #balance
+      fromBal <- preuse $ #env % #contracts % ix from % #balance % ix 0
       costOfCall fees recipientExists xValue availableGas xGas xTo $ \cost gas' -> do
         let checkCallDepth =
               if length vm.frames >= 1024
@@ -1210,7 +1215,7 @@ callChecks this xGas xContext xTo xValue xInOffset xInSize xOutOffset xOutSize x
                 True -> do
                   assign' (#state % #stack) (Lit 0 : xs)
                   assign (#state % #returndata) mempty
-                  pushTrace $ ErrorTrace (BalanceTooLow xValue this.balance)
+                  pushTrace $ ErrorTrace (BalanceTooLow xValue $ NE.head this.balance)
                   next
                 False -> checkCallDepth
 
@@ -1508,8 +1513,8 @@ accessStorage addr slot continue = do
       -- --> This is because readStorage can do smart rewrites, but only in case
       --     the expression is of a particular format, which can be destroyed by simplification.
       --     However, without concretization, it may not find things that are actually in the storage
-      case readStorage slot c.storage of
-        Just x -> case readStorage slotConc c.storage of
+      case readStorage slot (NE.head c.storage) of
+        Just x -> case readStorage slotConc (NE.head c.storage) of
           Just (Lit _) -> continue x
           Just _ | not c.external -> continue x
           _ -> rpcCall c slotConc
@@ -1525,18 +1530,18 @@ accessStorage addr slot continue = do
               Nothing -> internalError $ "contract addr " <> show addr' <> " marked external not found in cache"
               -- At this point, we know the contract is external and the underlying storage
               -- is concrete. Check if the slot has already been fetched
-              Just contr -> if concStoreContains (Lit slot') contr.storage
-                then continue $ SLoad (Lit slot') contr.storage
+              Just contr -> if concStoreContains (Lit slot') (NE.head contr.storage)
+                then continue $ SLoad (Lit slot') (NE.head contr.storage)
                 else mkQuery addr' slot'
         else do
           -- Symbolic address that cannot be cajoled/solved into a concrete one
           -- We cannot query the underlying storage, as we don't know which one to query
           -- So we store and return 0, as it is the only sound option
-          modifying (#env % #contracts % ix addr % #storage) (writeStorage slot (Lit 0))
+          modifying (#env % #contracts % ix addr % (#storage % ix 0)) (writeStorage slot (Lit 0))
           continue $ Lit 0
       mkQuery :: Addr -> W256 -> EVM t ()
       mkQuery a s = query $ PleaseFetchSlot a s $ \x -> do
-        modifying (#env % #contracts % ix (LitAddr a) % #storage) (writeStorage (Lit s) (Lit x))
+        modifying (#env % #contracts % ix (LitAddr a) % (#storage % ix 0)) (writeStorage (Lit s) (Lit x))
         assign #result Nothing
         continue $ Lit x
 
@@ -1551,8 +1556,8 @@ accessTStorage addr slot continue = do
     Just c ->
       -- Try first without concretization. Then if we get a Just, with concretization
       -- See `accessStorage` for more details
-      case readStorage slot c.tStorage of
-        Just x -> case readStorage slotConc c.tStorage of
+      case readStorage slot (NE.head c.tStorage) of
+        Just x -> case readStorage slotConc (NE.head c.tStorage) of
           Just _ -> continue x
           Nothing -> continue $ Lit 0
         Nothing -> continue $ Lit 0
@@ -1561,7 +1566,7 @@ accessTStorage addr slot continue = do
         accessTStorage addr slot continue
 
 clearTStorages :: EVM t ()
-clearTStorages = (#env % #contracts) %= fmap (\c -> c { tStorage = ConcreteStore mempty } :: Contract)
+clearTStorages = (#env % #contracts) %= fmap (\c -> c { tStorage = ConcreteStore mempty NE.:| (NE.tail c.tStorage) } :: Contract)
 
 accountExists :: Expr EAddr -> VM t -> Bool
 accountExists addr vm =
@@ -1578,7 +1583,7 @@ accountEmpty c =
     _ -> False
   && c.nonce == (Just 0)
   -- TODO: handle symbolic balance...
-  && c.balance == Lit 0
+  && (NE.head c.balance) == Lit 0
 
 -- Adds constraints such that two symbolic addresses cannot alias each other
 -- and symbolic addresses cannot alias concrete addresses
@@ -1586,7 +1591,7 @@ addAliasConstraints :: EVM t ()
 addAliasConstraints = do
   vm <- get
   let addrConstr = noClash $ Map.keys vm.env.contracts
-  modifying #constraints ((++) addrConstr)
+  modifying (#constraints % ix 0) ((++) addrConstr)
   where
     noClash addrs = [a ./= b | a <- addrs, b <- addrs, Expr.isSymAddr b, a < b]
 
@@ -1719,7 +1724,7 @@ onlyDeployed addrExpr fallback continue = do
         _ -> Nothing
     runAllPaths val = do
         assign #result Nothing
-        pushTo #constraints $ Expr.simplifyProp (addrExpr .== val)
+        modifying (#constraints % ix 0) (Expr.simplifyProp (addrExpr .== val) :)
         continue (forceEWordToEAddr val)
 
 forceAddr :: forall t . (?conf :: Config, VMOps t, Typeable t) =>
@@ -1747,32 +1752,73 @@ unexpectedSymArgW msg n = unexpectedSymArg msg [n]
 unknownCode :: VMOps t => Expr EAddr -> EVM t ()
 unknownCode n = unexpectedSymArg "call target has unknown code" [n]
 
-freshBufFallback :: (?conf :: Config, VMOps t, ?op :: Word8) => [Expr EWord] -> EVM t ()
-freshBufFallback xs = do
+uninterpCall
+  :: forall t . (VMOps t, ?op :: Word8, ?conf :: Config, Typeable t)
+  => Contract
+  -> Expr EWord
+  -> Expr EWord
+  -> Expr EWord
+  -> Expr EWord
+  -> Expr EWord
+  -> Expr EWord
+  -> [Expr EWord]
+  -> EVM t ()
+uninterpCall this xTo xValue xInOffset xInSize xOutOffset xOutSize xs =
+  -- addresses not used in symbolic mode
+  callChecks this undefined undefined undefined xValue xInOffset xInSize xOutOffset xOutSize xs $
+    \xGas -> do
+      burn' xGas $ do
+        calldata <- readMemory xInOffset xInSize
+        abi <- maybeLitWordSimp . readBytes 4 (Lit 0) <$> readMemory xInOffset (Lit 4)
+        n <- length <$> use #interactions
+        let interaction
+              | ?op == 0xfa = StaticCall n xTo calldata abi xOutOffset xOutSize
+              | otherwise   = Call n xTo xValue calldata abi xOutOffset xOutSize
+        modifying #interactions (interaction :)
+        modifying #constraints (NE.cons [])
+        let resetContract :: Expr EAddr -> Contract -> Contract
+            resetContract addr c' =
+              c' { storage  = NE.cons (AbstractStore addr (Just n) Nothing) c'.storage
+                 , tStorage = NE.cons (AbstractStore addr (Just n) Nothing) c'.tStorage
+                 , balance  = NE.cons (Balance addr (Just n)) c'.balance
+                 }
+        modifying (#env % #contracts) $ Map.mapWithKey resetContract
+        freshBufFallback xs (Just n)
+
+freshBufFallback :: (?conf :: Config, VMOps t, ?op :: Word8) => [Expr EWord] -> Maybe Int -> EVM t ()
+freshBufFallback xs uninterpTag = do
   -- Reset caller if needed
   resetCaller <- use $ #state % #resetCaller
   when resetCaller $ assign (#state % #overrideCaller) Nothing
   -- overapproximate by returning a symbolic value
   freshVar <- use #freshVar
-  assign #freshVar (freshVar + 1)
+  when (isNothing uninterpTag) $
+    assign #freshVar (freshVar + 1)
   let opName = pack $ show $ getOp ?op
-  let freshVarExpr = Var (opName <> "-result-stack-fresh-" <> (pack . show) freshVar)
-  modifying #constraints ((:) (PLEq freshVarExpr (Lit 1) ))
-  let freshReturndataExpr = AbstractBuf (opName <> "-result-data-fresh-" <> (pack . show) freshVar)
-  modifying #constraints ((:) (PLEq (bufLength freshReturndataExpr) (Lit (2 ^ ?conf.maxBufSize))))
+  let freshVarExpr = case uninterpTag of
+        Just n -> Var ("Uninterp-" <> opName <> "-result-stack-fresh-" <> (pack . show) n)
+        Nothing -> Var (opName <> "-result-stack-fresh-" <> (pack . show) freshVar)
+  modifying (#constraints % ix 0) ((:) (PLEq freshVarExpr (Lit 1) ))
+  let freshReturndataExpr = case uninterpTag of
+        Just n -> AbstractBuf ("Uninterp-" <> opName <> "-result-data-fresh-" <> (pack . show) n)
+        Nothing -> AbstractBuf (opName <> "-result-data-fresh-" <> (pack . show) freshVar)
+  modifying (#constraints % ix 0) ((:) (PLEq (bufLength freshReturndataExpr) (Lit (2 ^ ?conf.maxBufSize))))
   assign (#state % #returndata) freshReturndataExpr
   next >> assign' (#state % #stack) (freshVarExpr:xs)
 
-freshVarFallback:: (VMOps t, ?op :: Word8) => [Expr EWord] -> Expr a -> EVM t ()
-freshVarFallback xs _ = do
+freshVarFallback:: (VMOps t, ?op :: Word8) => [Expr EWord] -> Maybe Int -> Expr a -> EVM t ()
+freshVarFallback xs uninterpTag _ = do
   -- Reset caller if needed
   resetCaller <- use $ #state % #resetCaller
   when resetCaller $ assign (#state % #overrideCaller) Nothing
   -- overapproximate by returning a symbolic value
   freshVar <- use #freshVar
-  assign #freshVar (freshVar + 1)
+  when (isNothing uninterpTag) $
+    assign #freshVar (freshVar + 1)
   let opName = pack $ show $ getOp ?op
-  let freshVarExpr = Var (opName <> "-result-stack-fresh-" <> (pack . show) freshVar)
+  let freshVarExpr = case uninterpTag of
+        Just n -> Var ("Uninterp-" <> opName <> "-result-stack-fresh-" <> (pack . show) n)
+        Nothing -> Var (opName <> "-result-stack-fresh-" <> (pack . show) freshVar)
   next >> assign' (#state % #stack) (freshVarExpr:xs)
 
 forceConcrete :: (?conf :: Config, VMOps t) => Expr EWord -> String -> (W256 -> EVM t ()) -> EVM t ()
@@ -1927,14 +1973,14 @@ cheatActions = Map.fromList
         [a, amt] ->
           forceAddr a (unexpectedSymArgW "vm.deal: cannot decode target into an address") $ \usr ->
             fetchAccount usr $ \_ -> do
-              assign (#env % #contracts % ix usr % #balance) amt
+              assign (#env % #contracts % ix usr % (#balance % ix 0)) amt
               doStop
         _ -> vmError (BadCheatCode "deal(address,uint256) parameter decoding failed" sig)
 
   , action "assume(bool)" $
       \sig input -> case decodeStaticArgs 0 1 input of
         [c] -> do
-          whenSymbolicElse (modifying #constraints ((:) (PEq (Lit 1) c)) >> doStop) $ do
+          whenSymbolicElse (modifying (#constraints % ix 0) (((:) (PEq (Lit 1) c))) >> doStop) $ do
             case c of
               Lit v -> if (v == 0) then (terminateVMWithError AssumeCheatFailed) else doStop
               _ -> internalError "Symbolic value encountered in concrete mode"
@@ -1951,7 +1997,7 @@ cheatActions = Map.fromList
       \sig input -> case decodeStaticArgs 0 3 input of
         [a, slot, new] -> case wordToAddr a of
           Just a'@(LitAddr _) -> fetchAccount a' $ \_ -> do
-            modifying (#env % #contracts % ix a' % #storage) (writeStorage slot new)
+            modifying (#env % #contracts % ix a' % #storage % ix 0) (writeStorage slot new)
             doStop
           _ -> vmError (BadCheatCode "store(address,bytes32,bytes32) issue, address provided may not be an address?" sig)
         _ -> vmError (BadCheatCode "store(address,bytes32,bytes32) parameter decoding failed" sig)
@@ -2238,16 +2284,19 @@ delegateCall
   -> Expr EWord
   -> Expr EWord
   -> [Expr EWord]
+  -> Bool
   -> (Expr EAddr -> EVM t ()) -- fallback
   -> (Expr EAddr -> EVM t ()) -- continue
   -> EVM t ()
-delegateCall this gasGiven xTo xContext xValue xInOffset xInSize xOutOffset xOutSize xs fallback continue
+delegateCall this gasGiven xTo xContext xValue xInOffset xInSize xOutOffset xOutSize xs uninterp fallback continue
   | isPrecompileAddr xTo
       = forceConcreteAddr2 (xTo, xContext) "Cannot call precompile with symbolic addresses" $
           \(xTo', xContext') ->
             precompiledContract this gasGiven xTo' xContext' xValue xInOffset xInSize xOutOffset xOutSize xs
   | xTo == cheatCode = do
       cheat gasGiven (xInOffset, xInSize) (xOutOffset, xOutSize) xs
+  | uninterp =
+      uninterpCall this (WAddr xTo) xValue xInOffset xInSize xOutOffset xOutSize xs
   | otherwise =
       callChecks this gasGiven xContext xTo xValue xInOffset xInSize xOutOffset xOutSize xs $
         \xGas -> do
@@ -2309,7 +2358,7 @@ delegateCall this gasGiven xTo xContext xValue xInOffset xInSize xOutOffset xOut
 -- EIP-684 and EIP-7610: collision if nonce != 0, code is non-empty, or storage is non-empty
 collision :: Maybe Contract -> Bool
 collision c' = case c' of
-  Just c -> c.nonce /= Just 0 || not (isStorageEmpty c.storage) || case c.code of
+  Just c -> c.nonce /= Just 0 || not (isStorageEmpty (NE.head c.storage)) || case c.code of
     RuntimeCode (ConcreteRuntimeCode "") -> False
     RuntimeCode (SymbolicRuntimeCode b) -> not $ null b
     _ -> True
@@ -2318,7 +2367,7 @@ collision c' = case c' of
     isStorageEmpty :: Expr Storage -> Bool
     isStorageEmpty = \case
       ConcreteStore m -> Map.null m
-      AbstractStore _ _ -> True -- empty symbolic store
+      AbstractStore _ _ _ -> True -- empty symbolic store
       SStore _ _ _ -> False     -- has writes, so non-empty
       GVar _ -> internalError "unexpected global variable"
 
@@ -2358,11 +2407,11 @@ create self this xSize xGas xValue xs newAddr initCode = do
     modifying (#env % #contracts % ix self % #nonce) (fmap ((+) 1))
     next
   -- do we have enough balance
-  else branch (?conf).maxDepth (Expr.gt xValue this.balance) $ \case
+  else branch (?conf).maxDepth (Expr.gt xValue (NE.head this.balance)) $ \case
       True -> do
         assign' (#state % #stack) (Lit 0 : xs)
         assign (#state % #returndata) mempty
-        pushTrace $ ErrorTrace $ BalanceTooLow xValue this.balance
+        pushTrace $ ErrorTrace $ BalanceTooLow xValue (NE.head this.balance)
         next
         touchAccount self
         touchAccount newAddr
@@ -2382,43 +2431,64 @@ create self this xSize xGas xValue xs newAddr initCode = do
 
             zoom (#env % #contracts) $ do
               oldAcc <- use (at newAddr)
-              let oldBal = maybe (Lit 0) (.balance) oldAcc
+              let oldBal = maybe (Lit 0) (NE.head . (.balance)) oldAcc
 
-              assign (at newAddr) (Just (newContract & #balance .~ oldBal))
+              assign (at newAddr) (Just (newContract & (#balance % ix 0) .~ oldBal))
               modifying (ix self % #nonce) (fmap ((+) 1))
 
             let
               resetStorage :: Expr Storage -> Expr Storage
               resetStorage = \case
                   ConcreteStore _ -> ConcreteStore mempty
-                  AbstractStore a Nothing -> AbstractStore a Nothing
+                  AbstractStore a _ Nothing -> AbstractStore a Nothing Nothing -- Should the new store remember resets from previous contracts?
                   SStore _ _ p -> resetStorage p
-                  AbstractStore _ (Just _) -> internalError "unexpected logical store in EVM.hs"
+                  AbstractStore _ _ (Just _) -> internalError "unexpected logical store in EVM.hs"
                   GVar _  -> internalError "unexpected global variable"
 
-            modifying (#env % #contracts % ix newAddr % #storage) resetStorage
+            modifying (#env % #contracts % ix newAddr % #storage % ix 0) resetStorage
             modifying (#env % #contracts % ix newAddr % #origStorage) resetStorage
             modifying (#tx % #subState % #createdContracts) (insert newAddr)
 
             transfer self newAddr xValue
 
-            pushTrace (FrameTrace newContext)
-            next
-            vm1 <- get
-            pushTo #frames $ Frame
-              { context = newContext
-              , state   = vm1.state { stack = xs }
-              }
+            if (?conf.isolated)
+            then do
+              n <- length <$> use #interactions
+              modifying #interactions (CreateContract n xValue c :)
+              modifying #constraints (NE.cons [])
+              let resetContract :: Expr EAddr -> Contract -> Contract
+                  resetContract addr c' =
+                    c' { storage  = NE.cons (AbstractStore addr (Just n) Nothing) c'.storage
+                       , tStorage = NE.cons (AbstractStore addr (Just n) Nothing) c'.tStorage
+                       , balance  = NE.cons (Balance addr (Just n)) c'.balance
+                       }
+              modifying (#env % #contracts) $ Map.mapWithKey resetContract
+              -- freshVarFallback xs undefined
+              freshVar <- use #freshVar
+              assign #freshVar (freshVar + 1)
+              let opName = pack $ show $ getOp ?op
+              let freshVarExpr = Var (opName <> "-result-stack-fresh-" <> (pack . show) freshVar)
+              modifying (#constraints % ix 0) (POr (PEq freshVarExpr (Lit 0)) (PEq freshVarExpr (WAddr newAddr)):)
+              next >> assign' (#state % #stack) (freshVarExpr:xs)
+            else do
+              pushTrace (FrameTrace newContext)
+              next
+              vm1 <- get
+              pushTo #frames $ Frame
+                { context = newContext
+                , state   = vm1.state { stack = xs }
+                }
 
-            state :: FrameState t <- lift blankState
-            assign #state $ state
-              { contract     = newAddr
-              , codeContract = newAddr
-              , code         = c
-              , callvalue    = xValue
-              , caller       = self
-              , gas          = xGas
-              }
+              state :: FrameState t <- lift blankState
+              assign #state $ state
+                { contract     = newAddr
+                , codeContract = newAddr
+                , code         = c
+                , callvalue    = xValue
+                , caller       = self
+                , gas          = xGas
+                }
+
 
 -- | Parses a raw Buf into an InitCode
 --
@@ -2796,16 +2866,16 @@ traceForest :: VM t -> Forest Trace
 traceForest vm = zipperRootForest vm.traces
 
 traceForest' :: Expr End -> Forest Trace
-traceForest' (Success _ (TraceContext f _ _) _ _) = f
+traceForest' (Success _ (TraceContext f _ _) _ _ _) = f
 traceForest' (Partial _ (TraceContext f _ _) _) = f
 traceForest' (Failure _ (TraceContext f _ _) _) = f
-traceForest' (GVar {}) = internalError"Internal Error: Unexpected GVar"
+traceForest' (GVar {}) = internalError "Internal Error: Unexpected GVar"
 
 traceContext :: Expr End -> TraceContext
-traceContext (Success _ c _ _) = c
+traceContext (Success _ c _ _ _) = c
 traceContext (Partial _ c _) = c
 traceContext (Failure _ c _) = c
-traceContext (GVar {}) = internalError"Internal Error: Unexpected GVar"
+traceContext (GVar {}) = internalError "Internal Error: Unexpected GVar"
 
 traceTopLog :: [Expr Log] -> EVM t ()
 traceTopLog [] = noop
@@ -3226,15 +3296,14 @@ instance VMOps Symbolic where
   partial e = assign #result $ Just (Unfinished e)
   branch depthLimit cond continue = do
     loc <- codeloc
-    pathconds <- use #constraints
+    pathconds <- concat . NE.toList <$> use #constraints
     vm <- get
     query $ PleaseAskSMT cond pathconds (runBothPaths loc vm.exploreDepth)
     where
       runBothPaths loc _ (Case v) = do
         assign #result Nothing
         let condSimp = Expr.simplify cond
-        pushTo #constraints $ if v then Expr.simplifyProp (Lit 0 ./= condSimp)
-                                   else Expr.simplifyProp (Lit 0 .== condSimp)
+        modifying (#constraints % ix 0) ((if v then Expr.simplifyProp (Lit 0 ./= condSimp) else Expr.simplifyProp (Lit 0 .== condSimp)) :)
         (iteration, _) <- use (#iterations % at loc % non (0,[]))
         stack <- use (#state % #stack)
         assign (#pathsVisited % at (loc, iteration)) (Just v)
@@ -3248,7 +3317,7 @@ instance VMOps Symbolic where
   -- if it's e.g.a JUMP, only 2 bytes can be relevant. This allows us to avoid
   -- getting solutions that are nonsensical
   manySolutions maxDepth ewordExpr numBytes continue = do
-    pathconds <- use #constraints
+    pathconds <- concat . NE.toList <$> use #constraints
     vm <- get
     query $ PleaseGetSols ewordExpr numBytes pathconds $ \case
       Just concVals -> do
@@ -3259,7 +3328,7 @@ instance VMOps Symbolic where
           [] -> finishAllFramesAndStop
           [val] -> do
             assign #result Nothing
-            pushTo #constraints $ Expr.simplifyProp (ewordExpr .== (Lit val))
+            modifying (#constraints % ix 0) $ (Expr.simplifyProp (ewordExpr .== (Lit val)) :)
             continue $ Just val
           _ -> fork maxDepth vm.exploreDepth $ PleaseRunAll (map Lit concVals) runAllPaths
       Nothing -> do
@@ -3268,7 +3337,7 @@ instance VMOps Symbolic where
     where
       runAllPaths val = do
         assign #result Nothing
-        pushTo #constraints $ Expr.simplifyProp (ewordExpr .== val)
+        modifying (#constraints % ix 0) (Expr.simplifyProp (ewordExpr .== val) :)
         case val of
           Lit v -> continue $ Just v
           _ -> internalError "runAllPaths can only get concrete values here"
@@ -3396,9 +3465,9 @@ instance VMOps Concrete where
       minerPay     = tx.priorityFee * (into gasUsed)
 
     modifying (#env % #contracts)
-       (Map.adjust (over #balance (Expr.add (Lit originPay))) tx.origin)
+       (Map.adjust (over (#balance % ix 0) (Expr.add (Lit originPay))) tx.origin)
     modifying (#env % #contracts)
-       (Map.adjust (over #balance (Expr.add (Lit minerPay))) block.coinbase)
+       (Map.adjust (over (#balance % ix 0) (Expr.add (Lit minerPay))) block.coinbase)
 
   pushGas = do
     vm <- get

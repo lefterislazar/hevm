@@ -27,7 +27,7 @@ import Data.Word (Word64)
 import GHC.Conc (getNumProcessors)
 import GitHash
 import Numeric.Natural (Natural)
-import Optics.Core ((&), set)
+import Optics.Core ((&), set, ix, (%))
 import Witch (unsafeInto)
 import Options.Generic as OptionsGeneric
 import Options.Applicative as Options
@@ -94,6 +94,7 @@ data CommonOptions = CommonOptions
   , numSolvers    ::Maybe Natural
   , maxIterations ::Integer
   , promiseNoReent::Bool
+  , isolated      ::Bool
   , maxBufSize    ::Int
   , maxWidth      ::Int
   , maxDepth      ::Maybe Int
@@ -125,6 +126,7 @@ commonOptions = CommonOptions
   <*> (optional $ option auto $ long "num-solvers" <> help "Number of solver instances to use (default: number of cpu cores)")
   <*> (option auto $ long "max-iterations"  <> showDefault <> value 5 <> help "Number of times we may revisit a particular branching point. For no bound, set -1")
   <*> (switch $ long "promise-no-reent"     <> help "Promise no reentrancy is possible into the contract(s) being examined")
+  <*> (switch $ long "isolated"             <> help "Do not expore calls")
   <*> (option auto $ long "max-buf-size"    <> value 64 <> help "Maximum size of buffers such as calldata and returndata in exponents of 2 (default: 64, i.e. 2^64 bytes)")
   <*> (option auto $ long "max-width"      <> showDefault <> value 100 <> help "Max number of concrete values to explore when encountering a symbolic value. This is a form of branch width limitation per symbolic value")
   <*> (optional $ option auto $ long "max-depth" <> help "Limit maximum depth of branching during exploration (default: unlimited)")
@@ -369,6 +371,7 @@ main = do
         , dumpTrace = cOpts.trace
         , decomposeStorage = Prelude.not cOpts.noDecompose
         , promiseNoReent = cOpts.promiseNoReent
+        , isolated = cOpts.isolated
         , maxBufSize = cOpts.maxBufSize
         , maxWidth = cOpts.maxWidth
         , maxDepth = cOpts.maxDepth
@@ -661,7 +664,7 @@ vmFromCommand cOpts cExecOpts cFileOpts execOpts sess = do
             -- if both code and url is given,
             -- fetch the contract and overwrite the code
               pure $ initialContract (mkCode $ fromJust code)
-                & set #balance  (Lit rpcContract.balance)
+                & set (#balance % ix 0)  (Lit rpcContract.balance)
                 & set #nonce    (Just rpcContract.nonce)
 
     (Just url, Just addr', Nothing) ->
@@ -780,7 +783,7 @@ symvmFromCommand cExecOpts sOpts cFileOpts sess calldata = do
                   exitFailure
                 else pure $ do
                   initialContract (mkCode $ fromJust c')
-                        & set #balance (Lit rpcContract'.balance)
+                        & set (#balance % ix 0) (Lit rpcContract'.balance)
                         & set #nonce (Just rpcContract'.nonce)
 
     (_, _, Just c) -> liftIO $ do

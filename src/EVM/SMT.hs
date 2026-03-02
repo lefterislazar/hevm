@@ -198,7 +198,7 @@ referencedAbstractStores :: TraversableTerm a => a -> Set Builder
 referencedAbstractStores term = foldTerm go mempty term
   where
     go = \case
-      AbstractStore s idx -> Set.singleton (storeName s idx)
+      AbstractStore s rsts idx -> Set.singleton (storeName s rsts idx)
       _ -> mempty
 
 referencedAddrs :: TraversableTerm a => a -> Set Builder
@@ -230,7 +230,7 @@ referencedFrameContext expr = nubOrd $ foldTerm go [] expr
     go :: Expr a -> [(Builder, [Prop])]
     go = \case
       o@TxValue -> [(fromRight' $ exprToSMT o, [])]
-      o@(Balance _) -> [(fromRight' $ exprToSMT o, [PLT o (Lit $ 2 ^ (96 :: Int))])]
+      o@(Balance _ _) -> [(fromRight' $ exprToSMT o, [PLT o (Lit $ 2 ^ (96 :: Int))])]
       o@(Gas _ _) -> [(fromRight' $ exprToSMT o, [])]
       o@(CodeHash (LitAddr _)) -> [(fromRight' $ exprToSMT o, [])]
       _ -> []
@@ -263,11 +263,11 @@ findStorageReads p = foldProp go mempty p
     go = \case
       SLoad slot store | baseIsAbstractStore store -> case Expr.getAddr store of
           Nothing -> internalError $ "could not extract address from: " <> show store
-          Just address -> StorageReads $ Map.singleton (address, Expr.getLogicalIdx store) (Set.singleton slot)
+          Just address -> StorageReads $ Map.singleton (address, Expr.getAbstrs store, Expr.getLogicalIdx store) (Set.singleton slot)
       _ -> mempty
 
     baseIsAbstractStore :: Expr 'Storage -> Bool
-    baseIsAbstractStore (AbstractStore _ _) = True
+    baseIsAbstractStore (AbstractStore _ _ _) = True
     baseIsAbstractStore (ConcreteStore _) = False
     baseIsAbstractStore (SStore _ _ base) = baseIsAbstractStore base
     baseIsAbstractStore (GVar _) = internalError "Unexpected GVar"
@@ -520,7 +520,7 @@ exprToSMT = \case
     pure $ "(keccak " <> enc <> " " <> sz <> ")"
 
   TxValue -> pure $ fromString "txvalue"
-  Balance a -> pure $ fromString "balance_" <> formatEAddr a
+  Balance a b -> pure $ fromString "balance_" <> formatMaybe b <> "_" <> formatEAddr a
 
   Origin ->  pure "origin"
   BlockHash a -> do
@@ -576,7 +576,7 @@ exprToSMT = \case
 
   -- we need to do a bit of processing here.
   ConcreteStore s -> encodeConcreteStore s
-  AbstractStore a idx -> pure $ storeName a idx
+  AbstractStore a rsts idx -> pure $ storeName a rsts idx
   SStore idx val prev -> do
     encIdx  <- exprToSMT idx
     encVal  <- exprToSMT val
@@ -713,9 +713,13 @@ encodeConcreteStore s = foldM encodeWrite ("((as const Storage) #x00000000000000
       encVal <- exprToSMT $ Lit val
       pure $ "(store " <> prev `sp` encKey `sp` encVal <> ")"
 
-storeName :: Expr EAddr -> Maybe W256 -> Builder
-storeName a Nothing = fromString ("baseStore_") <> formatEAddr a
-storeName a (Just idx) = fromString ("baseStore_") <> formatEAddr a <> "_" <> (fromString $ show idx)
+storeName :: Expr EAddr -> Maybe Int -> Maybe W256 -> Builder
+storeName a rsts Nothing = fromString ("baseStore_") <> formatEAddr a <> "_" <> formatMaybe rsts
+storeName a rsts (Just idx) = fromString ("baseStore_") <> formatEAddr a <> "_" <> formatMaybe rsts <> "_" <> (fromString $ show idx)
+
+formatMaybe :: Show a => Maybe a -> Builder
+formatMaybe (Just i) = fromString $ "just" <> show i
+formatMaybe Nothing = "nothing"
 
 formatEAddr :: Expr EAddr -> Builder
 formatEAddr = \case
@@ -748,6 +752,12 @@ parseSC sc = internalError $ "cannot parse: " <> show sc
 parseVar :: TS.Text -> Expr EWord
 parseVar = Var
 
+parseMaybeInt :: TS.Text -> Maybe Int
+parseMaybeInt text
+  | Just i <- TS.stripPrefix "just" text = Just $ read $ TS.unpack i
+  | text == "nothing" = Nothing
+  | otherwise = internalError $ "cannot parse: " <> show text
+
 parseEAddr :: TS.Text -> Expr EAddr
 parseEAddr name
   | Just a <- TS.stripPrefix "litaddr_" name = LitAddr (read (TS.unpack a))
@@ -768,7 +778,7 @@ parseBlockCtx val = internalError $ "cannot parse '" <> (TS.unpack val) <> "' in
 parseTxCtx :: TS.Text -> Expr EWord
 parseTxCtx name
   | name == "txvalue" = TxValue
-  | Just a <- TS.stripPrefix "balance_" name = Balance (parseEAddr a)
+  | Just (a,b) <- TS.breakOn "_" <$> TS.stripPrefix "balance_" name = Balance (parseEAddr (TS.drop 1 b)) (parseMaybeInt a) 
   | Just a <- TS.stripPrefix "codehash_" name = CodeHash (parseEAddr a)
   | otherwise = internalError $ "cannot parse " <> (TS.unpack name) <> " into an Expr"
 
@@ -864,10 +874,10 @@ getBufs getVal bufs = foldM getBuf mempty bufs
 getStore
   :: ValGetter
   -> StorageReads
-  -> MaybeIO (Map (Expr EAddr) (Map W256 W256))
+  -> MaybeIO (Map (Expr EAddr, Maybe Int) (Map W256 W256))
 getStore getVal (StorageReads innerMap) = do
-  results <- forM (Map.toList innerMap) $ \((addr, idx), slots) -> do
-    let name = toLazyText (storeName addr idx)
+  results <- forM (Map.toList innerMap) $ \((addr, rsts, idx), slots) -> do
+    let name = toLazyText (storeName addr rsts idx)
     raw <- getVal name
     fun <- hoistMaybe $ do
       Right (ResSpecific (valParsed :| [])) <- pure $ parseCommentFreeFileMsg getValueRes (T.toStrict raw)
@@ -878,7 +888,7 @@ getStore getVal (StorageReads innerMap) = do
     store <- foldM (\m slot -> do
       slot' <- queryValue getVal slot
       pure $ Map.insert slot' (fun slot') m) Map.empty (Set.toList slots)
-    pure (addr, store)
+    pure ((addr, rsts), store)
   pure $ Map.fromList results
 
 -- | Ask the solver to give us the concrete value of an arbitrary abstract word

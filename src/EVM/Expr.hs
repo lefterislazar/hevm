@@ -622,7 +622,7 @@ readStorage w st = go (simplifyNoLitToKeccak w) (simplifyNoLitToKeccak st)
   where
     go :: Expr EWord -> Expr Storage -> Maybe (Expr EWord)
     go _ (GVar _) = internalError "Can't read from a GVar"
-    go slot s@(AbstractStore _ _) = Just $ SLoad slot s
+    go slot s@(AbstractStore _ _ _) = Just $ SLoad slot s
     go (Lit l) (ConcreteStore s) = Lit <$> Map.lookup l s
     go slot store@(ConcreteStore _) = Just $ SLoad slot store
     go slot s@(SStore prevSlot val prev) = case (prevSlot, slot) of
@@ -797,19 +797,25 @@ concStoreContains :: Expr EWord -> Expr Storage -> Bool
 concStoreContains k@(Lit key) store = case store of
   ConcreteStore s -> Map.member key s
   SStore _ _ s -> concStoreContains k s
-  AbstractStore _ _ -> internalError "cannot read deeply into an AbstractStore"
+  AbstractStore _ _ _ -> internalError "cannot read deeply into an AbstractStore"
   GVar _ -> internalError "cannot read to a GVar"
 concStoreContains _ _ = internalError "readDeepStorage only supports concrete keys"
 
 getAddr :: Expr Storage -> Maybe (Expr EAddr)
 getAddr (SStore _ _ p) = getAddr p
-getAddr (AbstractStore a _) = Just a
+getAddr (AbstractStore a _ _) = Just a
 getAddr (ConcreteStore _) = Nothing
 getAddr (GVar _) = internalError "cannot determine addr of a GVar"
 
+getAbstrs :: Expr Storage -> Maybe Int
+getAbstrs (SStore _ _ p) = getAbstrs p
+getAbstrs (AbstractStore _ a _) = a
+getAbstrs (ConcreteStore _) = Nothing
+getAbstrs (GVar _) = internalError "cannot determine addr of a GVar"
+
 getLogicalIdx :: Expr Storage -> Maybe W256
 getLogicalIdx (SStore _ _ p) = getLogicalIdx p
-getLogicalIdx (AbstractStore _ idx) = idx
+getLogicalIdx (AbstractStore _ _ idx) = idx
 getLogicalIdx (ConcreteStore _) = Nothing
 getLogicalIdx (GVar _) = internalError "cannot determine addr of a GVar"
 
@@ -950,9 +956,9 @@ decomposeStorage = go
     -- Updates the logical base store of the given expression if it is safe to do so
     setLogicalBase :: Maybe W256 -> Expr Storage -> Maybe (Expr Storage)
 
-    setLogicalBase idx (AbstractStore addr Nothing) = Just $ AbstractStore addr idx
-    setLogicalBase idx (AbstractStore addr idx2) | idx == idx2 = Just $ AbstractStore addr idx
-    setLogicalBase _ (AbstractStore _ _) = internalError "we only rewrite idx once, on load"
+    setLogicalBase idx (AbstractStore addr rsts Nothing) = Just $ AbstractStore addr rsts idx
+    setLogicalBase idx (AbstractStore addr rsts idx2) | idx == idx2 = Just $ AbstractStore addr rsts idx
+    setLogicalBase _ (AbstractStore _ _ _) = internalError "we only rewrite idx once, on load"
     setLogicalBase idx (SStore k v prevStorage) = do
       (idx2, key2) <- inferLogicalIdx k
       b <- setLogicalBase idx prevStorage
@@ -987,7 +993,7 @@ simplifyNoLitToKeccak e = untilFixpoint (mapExpr go) e
 
     go (Failure a b c) = Failure (simplifyProps a) b c
     go (Partial a b c) = Partial (simplifyProps a) b c
-    go (Success a b c d) = Success (simplifyProps a) b c d
+    go (Success a b c d f) = Success (simplifyProps a) b c d f
 
     -- redundant CopySlice
     go (CopySlice (Lit 0x0) (Lit 0x0) (Lit 0x0) _ dst) = dst

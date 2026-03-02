@@ -34,9 +34,9 @@ foldEContract f _ g@(GVar _) = f g
 foldEContract f acc (C code storage tStorage balance _)
   =  acc
   <> foldCode f code
-  <> foldExpr f mempty storage
-  <> foldExpr f mempty tStorage
-  <> foldExpr f mempty balance
+  <> foldl' (foldExpr f) mempty storage
+  <> foldl' (foldExpr f) mempty tStorage
+  <> foldl' (foldExpr f) mempty balance
 
 foldCode :: forall b . Monoid b => (forall a . Expr a -> b) -> ContractCode -> b
 foldCode f = \case
@@ -88,7 +88,7 @@ foldExpr f acc expr = acc <> (go expr)
 
       -- control flow
 
-      e@(Success a _ c d) -> f e
+      e@(Success a _ c d _) -> f e
                           <> foldl' (foldProp f) mempty a
                           <> go c
                           <> foldl' (foldExpr f) mempty (Map.keys d)
@@ -179,7 +179,7 @@ foldExpr f acc expr = acc <> (go expr)
       -- storage
 
       e@(ConcreteStore _) -> f e
-      e@(AbstractStore _ _) -> f e
+      e@(AbstractStore _ _ _) -> f e
       e@(SLoad a b) -> f e <> (go a) <> (go b)
       e@(SStore a b c) -> f e <> (go a) <> (go b) <> (go c)
 
@@ -347,7 +347,7 @@ mapExprM f expr = case expr of
   Partial a b c -> do
     a' <- mapM (mapPropM f) a
     f (Partial a' b c)
-  Success a b c d -> do
+  Success a b c d e -> do
     a' <- mapM (mapPropM f) a
     c' <- mapExprM f c
     d' <- do
@@ -357,7 +357,7 @@ mapExprM f expr = case expr of
         v' <- mapEContractM f v
         pure (k',v')
       pure $ Map.fromList x'
-    f (Success a' b c' d')
+    f (Success a' b c' d' e)
 
   -- integers
 
@@ -516,9 +516,9 @@ mapExprM f expr = case expr of
   -- frame context
 
   Gas a b -> f (Gas a b)
-  Balance a -> do
+  Balance a b -> do
     a' <- mapExprM f a
-    f (Balance a')
+    f (Balance a' b)
 
   -- code
 
@@ -540,7 +540,7 @@ mapExprM f expr = case expr of
   -- storage
 
   ConcreteStore b -> f (ConcreteStore b)
-  AbstractStore a b -> f (AbstractStore a b)
+  AbstractStore a b c -> f (AbstractStore a b c)
   SLoad a b -> do
     a' <- mapExprM f a
     b' <- mapExprM f b
@@ -642,17 +642,17 @@ mapEContractM :: Monad m => (forall a . Expr a -> m (Expr a)) -> Expr EContract 
 mapEContractM _ g@(GVar _) = pure g
 mapEContractM f (C code storage tStorage balance nonce) = do
   code' <- mapCodeM f code
-  storage' <- mapExprM f storage
-  tStorage' <- mapExprM f tStorage
-  balance' <- mapExprM f balance
+  storage' <- mapM (mapExprM f) storage
+  tStorage' <- mapM (mapExprM f) tStorage
+  balance' <- mapM (mapExprM f) balance
   pure $ C code' storage' tStorage' balance' nonce
 
 mapContractM :: Monad m => (forall a . Expr a -> m (Expr a)) -> Contract -> m (Contract)
 mapContractM f c = do
   code' <- mapCodeM f c.code
-  storage' <- mapExprM f c.storage
+  storage' <- mapM (mapExprM f) c.storage
   origStorage' <- mapExprM f c.origStorage
-  balance' <- mapExprM f c.balance
+  balance' <- mapM (mapExprM f) c.balance
   pure $ c { code = code', storage = storage', origStorage = origStorage', balance = balance' }
 
 mapCodeM :: Monad m => (forall a . Expr a -> m (Expr a)) -> ContractCode -> m (ContractCode)

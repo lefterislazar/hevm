@@ -400,7 +400,7 @@ runCodeWithTrace rpcinfo evmEnv alloc txn fromAddr toAddress = withSolvers Z3 0 
 vmForRuntimeCode :: ByteString -> Expr Buf -> EVMToolEnv -> EVMToolAlloc -> EVM.Transaction.Transaction -> Expr EAddr -> Expr EAddr -> ST RealWorld (VM Concrete)
 vmForRuntimeCode runtimecode calldata' evmToolEnv alloc txn fromAddr toAddress =
   let contract = initialContract (RuntimeCode (ConcreteRuntimeCode runtimecode))
-                 & set #balance (Lit alloc.balance)
+                 & set (#balance % ix 0) (Lit alloc.balance)
   in (makeVm $ (defaultVMOpts @Concrete)
     { contract = contract
     , calldata = (calldata', [])
@@ -733,7 +733,7 @@ checkTraceAndOutputs contract gasLimit txData = do
         concretizedExpr = map (concretize (ConcreteBuf txData)) $ expr
         simplConcExpr = map Expr.simplify concretizedExpr
         getReturnVal :: Expr End -> Maybe ByteString
-        getReturnVal (Success _ _ (ConcreteBuf bs) _) = Just bs
+        getReturnVal (Success _ _ (ConcreteBuf bs) _ _) = Just bs
         getReturnVal _ = Nothing
         simplConcrExprRetval = mapMaybe getReturnVal simplConcExpr
       traceOK <- compareTraces hevmTrace (evmtoolTraceOutput.trace)

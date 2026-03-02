@@ -1363,5 +1363,5 @@ expectAllBranchesFail c sig = do
   expectNoCexNoPartial result
   where
     post _ = \case
-      Success _ _ _ _ -> PBool False
+      Success _ _ _ _ _ -> PBool False
       _ -> PBool True

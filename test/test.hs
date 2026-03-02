@@ -22,6 +22,7 @@ import Data.Binary.Put (runPut)
 import Data.Binary.Get (runGetOrFail)
 import Data.Either
 import Data.List qualified as List
+import Data.List.NonEmpty qualified as NE
 import Data.Map.Strict qualified as Map
 import Data.Maybe
 import Data.Set qualified as Set
@@ -979,12 +980,12 @@ tests = testGroup "hevm"
         let isSuc (Success {}) = True
             isSuc _ = False
         case filter isSuc paths of
-          [Success _ _ _ store] -> do
+          [Success _ _ _ store _] -> do
             let ca = fromJust (Map.lookup (SymAddr "freshSymAddr1") store)
             let code = case ca.code of
                   RuntimeCode (ConcreteRuntimeCode c') -> c'
                   _ -> internalError "expected concrete code"
-            assertEqualM "balance mismatch" (Var "arg1") (Expr.simplify ca.balance)
+            assertEqualM "balance mismatch" (Var "arg1") (Expr.simplify (NE.head ca.balance))
             assertEqualM "code mismatch" (stripBytecodeMetadata a) (stripBytecodeMetadata code)
             assertEqualM "nonce mismatch" (Just 1) ca.nonce
           _ -> assertBoolM "too many/too few success nodes!" False
@@ -2420,7 +2421,7 @@ tests = testGroup "hevm"
                              [x', y'] -> (x', y')
                              _ -> internalError "expected 2 args"
               in case leaf of
-                   Success _ _ b _ -> (ReadWord (Lit 0) b) .== (Add x y)
+                   Success _ _ b _ _ -> (ReadWord (Lit 0) b) .== (Add x y)
                    _ -> PBool True
             sig = Just (Sig "add(uint256,uint256)" [AbiUIntType 256, AbiUIntType 256])
         (res, []) <- withDefaultSolver $ \s ->
@@ -2448,7 +2449,7 @@ tests = testGroup "hevm"
                              [x', y'] -> (x', y')
                              _ -> internalError "expected 2 args"
               in case leaf of
-                   Success _ _ b _ -> (ReadWord (Lit 0) b) .== (Mul (Lit 2) y)
+                   Success _ _ b _ _ -> (ReadWord (Lit 0) b) .== (Mul (Lit 2) y)
                    _ -> PBool True
         (res, []) <- withDefaultSolver $ \s ->
           verifyContract s safeAdd (Just (Sig "add(uint256,uint256)" [AbiUIntType 256, AbiUIntType 256])) [] defaultVeriOpts (Just pre) post
@@ -2473,11 +2474,11 @@ tests = testGroup "hevm"
                         [y'] -> y'
                         _ -> internalError "expected 1 arg"
                   this = prestate.state.codeContract
-                  prestore = (fromJust (Map.lookup this prestate.env.contracts)).storage
+                  prestore = NE.head (fromJust (Map.lookup this prestate.env.contracts)).storage
                   prex = Expr.readStorage' (Lit 0) prestore
               in case leaf of
-                Success _ _ _ postState -> let
-                    poststore = (fromJust (Map.lookup this postState)).storage
+                Success _ _ _ postState _ -> let
+                    poststore = NE.head (fromJust (Map.lookup this postState)).storage
                   in Expr.add prex (Expr.mul (Lit 2) y) .== (Expr.readStorage' (Lit 0) poststore)
                 _ -> PBool True
             sig = Just (Sig "f(uint256)" [AbiUIntType 256])
@@ -2532,12 +2533,12 @@ tests = testGroup "hevm"
                         [x',y'] -> (x',y')
                         _ -> error "expected 2 args"
                     this = prestate.state.codeContract
-                    prestore = (fromJust (Map.lookup this prestate.env.contracts)).storage
+                    prestore = NE.head (fromJust (Map.lookup this prestate.env.contracts)).storage
                     prex = Expr.readStorage' x prestore
                     prey = Expr.readStorage' y prestore
                 in case poststate of
-                     Success _ _ _ postcs -> let
-                           poststore = (fromJust (Map.lookup this postcs)).storage
+                     Success _ _ _ postcs _ -> let
+                           poststore = NE.head (fromJust (Map.lookup this postcs)).storage
                            postx = Expr.readStorage' x poststore
                            posty = Expr.readStorage' y poststore
                        in Expr.add prex prey .== Expr.add postx posty
@@ -2569,12 +2570,12 @@ tests = testGroup "hevm"
                         [x',y'] -> (x',y')
                         _ -> error "expected 2 args"
                     this = prestate.state.codeContract
-                    prestore = (fromJust (Map.lookup this prestate.env.contracts)).storage
+                    prestore = NE.head (fromJust (Map.lookup this prestate.env.contracts)).storage
                     prex = Expr.readStorage' x prestore
                     prey = Expr.readStorage' y prestore
                 in case leaf of
-                     Success _ _ _ poststate -> let
-                           poststore = (fromJust (Map.lookup this poststate)).storage
+                     Success _ _ _ poststate _ -> let
+                           poststore = NE.head (fromJust (Map.lookup this poststate)).storage
                            postx = Expr.readStorage' x poststore
                            posty = Expr.readStorage' y poststore
                        in Expr.add prex prey .== Expr.add postx posty
@@ -3037,7 +3038,7 @@ tests = testGroup "hevm"
             verify s (Fetch.noRpcFetcher s) defaultVeriOpts vm (checkAssertions defaultPanicCodes) Nothing
 
           let storeCex = cex.store
-              testCex = case (Map.lookup cAddr storeCex, Map.lookup aAddr storeCex) of
+              testCex = case (Map.lookup (cAddr,Nothing) storeCex, Map.lookup (aAddr,Nothing) storeCex) of
                           (Just sC, Just sA) -> case (Map.lookup 0 sC, Map.lookup 0 sA) of
                               (Just x, Just y) -> x /= y
                               (Just x, Nothing) -> x /= 0
@@ -3154,7 +3155,7 @@ tests = testGroup "hevm"
           (_, [(Cex (_, cex))]) <- withDefaultSolver $ \s -> checkAssert s [0x01] c (Just (Sig "fun(uint256)" [AbiUIntType 256])) [] defaultVeriOpts
           let addr = SymAddr "entrypoint"
               testCex = Map.size cex.store == 1 &&
-                        case Map.lookup addr cex.store of
+                        case Map.lookup (addr, Nothing) cex.store of
                           Just s -> Map.size s == 2 &&
                                     case (Map.lookup 0 s, Map.lookup 1 s) of
                                       (Just x, Just y) -> x /= y
@@ -3178,7 +3179,7 @@ tests = testGroup "hevm"
           let addr = SymAddr "entrypoint"
               a = getVar cex "arg1"
               testCex = Map.size cex.store == 1 &&
-                        case Map.lookup addr cex.store of
+                        case Map.lookup (addr, Nothing) cex.store of
                           Just s -> case (Map.lookup 0 s, Map.lookup (10 + a) s) of
                                       (Just x, Just y) -> x >= y
                                       _ -> False
@@ -3204,7 +3205,7 @@ tests = testGroup "hevm"
             \s -> verifyContract s c sig [] defaultVeriOpts Nothing (checkAssertions [0x01])
           let addr = SymAddr "entrypoint"
               testCex = Map.size cex.store == 1 &&
-                        case Map.lookup addr cex.store of
+                        case Map.lookup (addr, Nothing) cex.store of
                           Just s -> Map.size s == 2 &&
                                     case (Map.lookup 0 s, Map.lookup 1 s) of
                                       (Just x, Just y) -> x == y
@@ -3534,21 +3535,21 @@ tests = testGroup "hevm"
       assertEqualM "Must find two keccaks" 2 (length concrete)
     , testCase "store-over-concrete-buffer" $ runEnv (testEnv {config = testEnv.config {simp = False}}) $ do
       let
-        as = AbstractStore (SymAddr "test") Nothing
+        as = AbstractStore (SymAddr "test") Nothing Nothing
         cs = ConcreteStore $ Map.fromList [(0x1,0x2)]
         e1 = SLoad (Lit 0x1) (SStore (Lit 0x8) (SLoad (Lit 0x40) as) cs)
         eq = PEq e1 (Lit 0x0)
       conf <- readConfig
       let SMT2 _ (CexVars _ _ _ storeReads _ _) _ = fromRight (internalError "Must succeed") (assertProps conf [eq])
-      let expected = StorageReads $ Map.singleton (SymAddr "test", Nothing) (Set.singleton (Lit 0x40))
+      let expected = StorageReads $ Map.singleton (SymAddr "test", Nothing, Nothing) (Set.singleton (Lit 0x40))
       assertEqualM "Reads must be properly collected" storeReads expected
     , test "all-abstract-reads-detected" $ do
-      let mystore = (AbstractStore (SymAddr "test") Nothing)
+      let mystore = (AbstractStore (SymAddr "test") Nothing Nothing)
       let props = [PGT (SLoad (Lit 2) mystore) (SLoad (Lit 0) mystore)]
       conf <- readConfig
       let SMT2 _ cexVars _ = fromRight (internalError "Must succeed") (assertProps conf props)
       let (StorageReads m) = cexVars.storeReads
-      case Map.lookup ((SymAddr "test"), Nothing) m of
+      case Map.lookup (SymAddr "test", Nothing, Nothing) m of
         Nothing -> assertBoolM "Address missing from storage reads" False
         Just storeReads -> assertBoolM "Did not collect all abstract reads!" $ (Set.size storeReads) == 2
   ]

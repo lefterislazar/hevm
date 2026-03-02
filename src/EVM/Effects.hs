@@ -40,6 +40,7 @@ data Config = Config
   , dumpTrace        :: Bool
   , decomposeStorage :: Bool
   , promiseNoReent   :: Bool
+  , isolated         :: Bool
   , maxBufSize       :: Int
   , maxWidth         :: Int
   , maxDepth         :: Maybe Int
@@ -61,6 +62,7 @@ defaultConfig = Config
   , dumpTrace = False
   , decomposeStorage = True
   , promiseNoReent = False
+  , isolated = False
   , maxBufSize = 64
   , maxWidth = 100
   , maxDepth = Nothing
