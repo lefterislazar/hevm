@@ -989,7 +989,7 @@ exec1 conf = do
                             touchAccount from'
                             touchAccount callee
                             transfer from' callee xValue
-              where fallback = freshBufFallback xs Nothing
+              where fallback = freshBufFallback xs
                     uninterpFallback xto = uninterpCall this xto xValue xInOffset xInSize xOutOffset xOutSize xs
             _ -> underrun
 
@@ -1096,7 +1096,7 @@ exec1 conf = do
                       touchAccount self
                       touchAccount callee
                 where
-                  fallback = freshBufFallback xs Nothing
+                  fallback = freshBufFallback xs
             _ -> underrun
 
         OpSelfdestruct -> {-# SCC "OpSelfdestruct" #-}
@@ -1749,6 +1749,11 @@ unexpectedSymArg msg n = do
 unexpectedSymArgW :: (Typeable a, VMOps t) => String -> Expr a -> EVM t ()
 unexpectedSymArgW msg n = unexpectedSymArg msg [n]
 
+successfulInteraction :: Interaction -> Bool
+successfulInteraction (CreateContract _ b _ _) = b
+successfulInteraction (Call _ b _ _ _ _ _ _) = b
+successfulInteraction (StaticCall _ b _ _ _ _ _) = b
+
 unknownCode :: VMOps t => Expr EAddr -> EVM t ()
 unknownCode n = unexpectedSymArg "call target has unknown code" [n]
 
@@ -1770,38 +1775,60 @@ uninterpCall this xTo xValue xInOffset xInSize xOutOffset xOutSize xs =
       burn' xGas $ do
         calldata <- readMemory xInOffset xInSize
         abi <- maybeLitWordSimp . readBytes 4 (Lit 0) <$> readMemory xInOffset (Lit 4)
-        n <- length <$> use #interactions
-        let interaction
-              | ?op == 0xfa = StaticCall n xTo calldata abi xOutOffset xOutSize
-              | otherwise   = Call n xTo xValue calldata abi xOutOffset xOutSize
-        modifying #interactions (interaction :)
-        modifying #constraints (NE.cons [])
-        let resetContract :: Expr EAddr -> Contract -> Contract
-            resetContract addr c' =
-              c' { storage  = NE.cons (AbstractStore addr (Just n) Nothing) c'.storage
-                 , tStorage = NE.cons (AbstractStore addr (Just n) Nothing) c'.tStorage
-                 , balance  = NE.cons (Balance addr (Just n)) c'.balance
-                 }
-        modifying (#env % #contracts) $ Map.mapWithKey resetContract
-        freshBufFallback xs (Just n)
+        tag <- length <$> use #interactions
+        -- overapproximate by returning a symbolic value
+        let opName = pack $ show $ getOp ?op
+        let freshVarExpr = Var ("Uninterp-" <> (pack . show) tag <> "-" <> opName <> "-result-stack-fresh-")
+        let freshReturndataExpr = AbstractBuf ("Uninterp-" <> (pack . show) tag <> "-" <> opName <> "-result-data-fresh-")
+        let interaction success
+              | getOp ?op == OpStaticcall = StaticCall tag success xTo calldata abi xOutOffset xOutSize
+              | otherwise   = Call tag success xTo xValue calldata abi xOutOffset xOutSize
 
-freshBufFallback :: (?conf :: Config, VMOps t, ?op :: Word8) => [Expr EWord] -> Maybe Int -> EVM t ()
-freshBufFallback xs uninterpTag = do
+        -- Branch on call's success
+        branch (?conf).maxDepth (Expr.eq freshVarExpr (Lit 1)) $ \case
+          False -> do
+            modifying (#constraints % ix 0) ((:) (PEq freshVarExpr (Lit 0) ))
+            modifying (#constraints % ix 0) ((:) (PLEq (bufLength freshReturndataExpr) (Lit (2 ^ ?conf.maxBufSize))))
+            modifying #interactions (interaction False :)
+            assign (#state % #returndata) freshReturndataExpr
+            next >> assign' (#state % #stack) (freshVarExpr:xs)
+
+          True -> do
+            -- Reset caller if needed
+            resetCaller <- use $ #state % #resetCaller
+            when resetCaller $ assign (#state % #overrideCaller) Nothing
+
+            -- If opcode is not a staticcall then reabstract state
+            when (getOp ?op /= OpStaticcall) $ do
+              let resetContract :: Expr EAddr -> Contract -> Contract
+                  resetContract addr c' =
+                    c' { storage  = NE.cons (AbstractStore addr (Just tag) Nothing) c'.storage
+                       , tStorage = NE.cons (AbstractStore addr (Just tag) Nothing) c'.tStorage
+                       , balance  = NE.cons (Balance addr (Just tag)) c'.balance
+                       }
+              modifying (#env % #contracts) $ Map.mapWithKey resetContract
+              modifying #constraints (NE.cons [])
+              modifying #interactions (Call tag True xTo xValue calldata abi xOutOffset xOutSize:)
+
+            modifying #interactions (interaction True :)
+
+            modifying (#constraints % ix 0) ((:) (PEq freshVarExpr (Lit 1) ))
+            modifying (#constraints % ix 0) ((:) (PLEq (bufLength freshReturndataExpr) (Lit (2 ^ ?conf.maxBufSize))))
+            assign (#state % #returndata) freshReturndataExpr
+            next >> assign' (#state % #stack) (freshVarExpr:xs)
+
+freshBufFallback :: (?conf :: Config, VMOps t, ?op :: Word8) => [Expr EWord] -> EVM t ()
+freshBufFallback xs = do
   -- Reset caller if needed
   resetCaller <- use $ #state % #resetCaller
   when resetCaller $ assign (#state % #overrideCaller) Nothing
   -- overapproximate by returning a symbolic value
   freshVar <- use #freshVar
-  when (isNothing uninterpTag) $
-    assign #freshVar (freshVar + 1)
+  assign #freshVar (freshVar + 1)
   let opName = pack $ show $ getOp ?op
-  let freshVarExpr = case uninterpTag of
-        Just n -> Var ("Uninterp-" <> opName <> "-result-stack-fresh-" <> (pack . show) n)
-        Nothing -> Var (opName <> "-result-stack-fresh-" <> (pack . show) freshVar)
+  let freshVarExpr = Var (opName <> "-result-stack-fresh-" <> (pack . show) freshVar)
   modifying (#constraints % ix 0) ((:) (PLEq freshVarExpr (Lit 1) ))
-  let freshReturndataExpr = case uninterpTag of
-        Just n -> AbstractBuf ("Uninterp-" <> opName <> "-result-data-fresh-" <> (pack . show) n)
-        Nothing -> AbstractBuf (opName <> "-result-data-fresh-" <> (pack . show) freshVar)
+  let freshReturndataExpr = AbstractBuf (opName <> "-result-data-fresh-" <> (pack . show) freshVar)
   modifying (#constraints % ix 0) ((:) (PLEq (bufLength freshReturndataExpr) (Lit (2 ^ ?conf.maxBufSize))))
   assign (#state % #returndata) freshReturndataExpr
   next >> assign' (#state % #stack) (freshVarExpr:xs)
@@ -2453,23 +2480,31 @@ create self this xSize xGas xValue xs newAddr initCode = do
 
             if (?conf.isolated)
             then do
-              n <- length <$> use #interactions
-              modifying #interactions (CreateContract n xValue c :)
-              modifying #constraints (NE.cons [])
-              let resetContract :: Expr EAddr -> Contract -> Contract
-                  resetContract addr c' =
-                    c' { storage  = NE.cons (AbstractStore addr (Just n) Nothing) c'.storage
-                       , tStorage = NE.cons (AbstractStore addr (Just n) Nothing) c'.tStorage
-                       , balance  = NE.cons (Balance addr (Just n)) c'.balance
-                       }
-              modifying (#env % #contracts) $ Map.mapWithKey resetContract
-              -- freshVarFallback xs undefined
-              freshVar <- use #freshVar
-              assign #freshVar (freshVar + 1)
+              tag <- length <$> use #interactions
               let opName = pack $ show $ getOp ?op
-              let freshVarExpr = Var (opName <> "-result-stack-fresh-" <> (pack . show) freshVar)
-              modifying (#constraints % ix 0) (POr (PEq freshVarExpr (Lit 0)) (PEq freshVarExpr (WAddr newAddr)):)
-              next >> assign' (#state % #stack) (freshVarExpr:xs)
+              let freshVarExpr = Var ("Uninterp-" <> (pack . show) tag <> "-" <> opName <> "-result-stack-fresh-")
+
+              -- Branch on create's success
+              branch (?conf).maxDepth (Expr.eq freshVarExpr (Lit 0)) $ \case
+                True -> do
+                  modifying #interactions (CreateContract tag False xValue c :)
+                  modifying (#constraints % ix 0) (PEq freshVarExpr (Lit 0) :)
+                  next >> assign' (#state % #stack) (freshVarExpr:xs)
+
+                False -> do
+                  modifying #interactions (CreateContract tag True xValue c :)
+
+                  let resetContract :: Expr EAddr -> Contract -> Contract
+                      resetContract addr c' =
+                        c' { storage  = NE.cons (AbstractStore addr (Just tag) Nothing) c'.storage
+                           , tStorage = NE.cons (AbstractStore addr (Just tag) Nothing) c'.tStorage
+                           , balance  = NE.cons (Balance addr (Just tag)) c'.balance
+                           }
+                  modifying (#env % #contracts) $ Map.mapWithKey resetContract
+                  modifying #constraints (NE.cons [])
+
+                  modifying (#constraints % ix 0) (PEq freshVarExpr (WAddr newAddr):)
+                  next >> assign' (#state % #stack) (freshVarExpr:xs)
             else do
               pushTrace (FrameTrace newContext)
               next

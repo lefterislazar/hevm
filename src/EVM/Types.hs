@@ -343,7 +343,7 @@ data Expr (a :: EType) where
 
   ConcreteStore  :: (Map W256 W256) -> Expr Storage
   AbstractStore  :: Expr EAddr -- which contract is this store for?
-                 -> Maybe Int  -- how many resets to abstract have preceded this store
+                 -> Maybe Int  -- which uninterpreted interaction caused re-abstraction (isolated mode for Act)
                  -> Maybe W256 -- which logical store does this refer to? (e.g. solidity mappings / arrays)
                  -> Expr Storage
 
@@ -593,9 +593,9 @@ evmErrToString = \case
 
 -- | Interaction with external world for isolated execution
 data Interaction
-  = CreateContract { tag :: Int, value :: Expr EWord, bytecode :: ContractCode } -- store info about success? see possible failures
-  | Call           { tag :: Int, address :: Expr EWord, value :: Expr EWord, calldata :: Expr Buf, abi :: Maybe W256, retOffset :: Expr EWord, retSize :: Expr EWord }
-  | StaticCall     { tag :: Int, address :: Expr EWord, calldata :: Expr Buf, abi :: Maybe W256, retOffset :: Expr EWord, retSize :: Expr EWord }
+  = CreateContract { tag :: Int, success :: Bool, value :: Expr EWord, bytecode :: ContractCode } -- store info about success? see possible failures
+  | Call           { tag :: Int, success :: Bool, address :: Expr EWord, value :: Expr EWord, calldata :: Expr Buf, abi :: Maybe W256, retOffset :: Expr EWord, retSize :: Expr EWord }
+  | StaticCall     { tag :: Int, success :: Bool, address :: Expr EWord, calldata :: Expr Buf, abi :: Maybe W256, retOffset :: Expr EWord, retSize :: Expr EWord }
   deriving (Show, Eq, Ord)
 
 -- | Sometimes we can only partially execute a given program
