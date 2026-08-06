@@ -32,6 +32,7 @@ import Prelude hiding (LT, GT, Foldable(..))
 
 import Control.Monad
 import Control.Monad.Trans.Maybe (hoistMaybe)
+import Data.Char (isAlphaNum)
 import Data.Containers.ListUtils (nubOrd, nubInt)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
@@ -232,6 +233,8 @@ referencedFrameContext expr = nubOrd $ foldTerm go [] expr
       o@TxValue -> [(fromRight' $ exprToSMT o, [])]
       o@(Balance _) -> [(fromRight' $ exprToSMT o, [PLT o (Lit $ 2 ^ (96 :: Int))])]
       o@(Gas _ _) -> [(fromRight' $ exprToSMT o, [])]
+      o@(GasCost _ _) -> [(fromRight' $ exprToSMT o, [])]
+      o@(MemoryGasCost _) -> [(fromRight' $ exprToSMT o, [])]
       o@(CodeHash (LitAddr _)) -> [(fromRight' $ exprToSMT o, [])]
       _ -> []
 
@@ -586,6 +589,8 @@ exprToSMT = \case
   LitAddr n -> pure $ fromLazyText $ "(_ bv" <> T.pack (show (into n :: Integer)) <> " 160)"
   CodeHash a@(LitAddr _) -> pure $ fromLazyText "codehash_" <> formatEAddr a
   Gas prefix var -> pure $ fromLazyText $ "gas_" <> T.pack (TS.unpack prefix) <> T.pack (show var)
+  GasCost label args -> pure $ gasCostName label args
+  MemoryGasCost size -> pure $ gasCostName "memory" [size]
 
   a -> internalError $ "TODO: implement: " <> show a
   where
@@ -600,6 +605,14 @@ exprToSMT = \case
       aenc <- exprToSMT a
       benc <- exprToSMT b
       pure $ "(ite (= " <> benc <> " (_ bv0 256)) (_ bv0 256) " <>  "(" <> op `sp` aenc `sp` benc <> "))"
+
+gasCostName :: TS.Text -> [Expr EWord] -> Builder
+gasCostName label args =
+  fromLazyText $ "gascost_" <> T.fromStrict label <> "_" <> T.map sanitize (T.pack (show args))
+  where
+    sanitize c
+      | isAlphaNum c = c
+      | otherwise = '_'
 
 sp :: Builder -> Builder -> Builder
 a `sp` b = a <> (fromText " ") <> b

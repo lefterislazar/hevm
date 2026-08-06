@@ -21,7 +21,6 @@ import EVM.Op
 import EVM.Precompiled qualified
 import EVM.Solidity
 import EVM.Types
-import EVM.Types qualified as Expr (Expr(Gas))
 import EVM.Sign qualified
 import EVM.Concrete qualified as Concrete
 import EVM.CheatsTH
@@ -51,7 +50,7 @@ import Data.Maybe (fromMaybe, fromJust, isJust, isNothing, mapMaybe)
 import Data.Set (insert, member, fromList)
 import Data.Sequence (Seq)
 import Data.Sequence qualified as Seq
-import Data.Text (unpack, pack)
+import Data.Text (Text, unpack, pack)
 import Data.Text.Encoding (decodeUtf8)
 import Data.Tree
 import Data.Tree.Zipper qualified as Zipper
@@ -110,7 +109,7 @@ blankState = do
     , pc           = 0
     , stack        = mempty
     , memory
-    , memorySize   = 0
+    , memorySize   = Lit 0
     , calldata     = mempty
     , callvalue    = Lit 0
     , caller       = LitAddr 0
@@ -147,7 +146,11 @@ makeVm o = do
            [txorigin, txtoAddr, o.coinbase]
         ++ (fmap LitAddr [1..9])
         ++ (Map.keys txaccessList)
-      initialAccessedStorageKeys = fromList $ foldMap (uncurry (map . (,))) (Map.toList txaccessList)
+      initialAccessedStorageKeys = fromList
+        [ (addr, Lit key)
+        | (addr, keys) <- Map.toList txaccessList
+        , key <- keys
+        ]
       touched = if o.create then [txorigin] else [txorigin, txtoAddr]
   memory <- ConcreteMemory <$> VS.Mutable.new 0
   pure $ setEIP2935Storage o $ setEIP4788Storage o $ VM
@@ -172,7 +175,7 @@ makeVm o = do
       { pc = 0
       , stack = mempty
       , memory
-      , memorySize = 0
+      , memorySize = Lit 0
       , code = o.contract.code
       , contract = o.address
       , codeContract = o.address
@@ -186,7 +189,7 @@ makeVm o = do
       , resetCaller = False
       }
     , env = env
-    , burned = initialGas
+    , burned = initialBurnedGas
     , constraints = snd o.calldata
     , iterations = mempty
     , config = RuntimeConfig
@@ -725,11 +728,13 @@ exec1 conf = do
                       next
                       assign' (#state % #stack) xs
                       mcopy sz srcOff dstOff
-                _ -> do
-                  -- symbolic, ignore gas
-                  next
-                  assign' (#state % #stack) xs
-                  mcopy sz srcOff dstOff
+                _ ->
+                  burn' (abstractGas "mcopy" [sz]) $
+                    accessMemoryRange srcOff sz $
+                      accessMemoryRange dstOff sz $ do
+                        next
+                        assign' (#state % #stack) xs
+                        mcopy sz srcOff dstOff
             _ -> underrun
             where
             mcopy (Lit 0) _ _ = pure ()
@@ -791,11 +796,15 @@ exec1 conf = do
                 finalizeLoad readValue = do next; assign' (#state % #stack) (readValue:xs)
 
                 symbolicRead :: EVM t () = if this.external
-                  then accessStorage self x finalizeLoad
-                  else finalizeLoad $ Expr.readStorage' (Expr.concKeccakOnePass x) this.storage
+                  then do
+                    cost <- accessStorageGasCost fees self x
+                    burn' cost $ accessStorage self x finalizeLoad
+                  else do
+                    cost <- accessStorageGasCost fees self x
+                    burn' cost $ finalizeLoad $ Expr.readStorage' (Expr.concKeccakOnePass x) this.storage
 
                 concreteRead :: EVM t () = do
-                  acc <- accessStorageForGas self (forceLit x)
+                  acc <- accessStorageForGas self (Lit (forceLit x))
                   let cost = if acc then g_warm_storage_read else g_cold_sload
                   burn cost $ if this.external
                     then accessStorage self x finalizeLoad
@@ -826,7 +835,7 @@ exec1 conf = do
                           | (currentVal == originalVal) = g_sreset
                           | otherwise = g_sload
 
-                    acc <- accessStorageForGas self slot
+                    acc <- accessStorageForGas self (Lit slot)
                     let cold_storage_cost = if acc then 0 else g_cold_sload
                     burn (storage_cost + cold_storage_cost) $ do
                       updateVMState
@@ -838,8 +847,12 @@ exec1 conf = do
                           | o /= 0 && o == n -> refund (g_sreset - g_sload)
                           | o == 0 && o == n -> refund (g_sset - g_sload)
                           | otherwise -> pure ()
+
+                symbolicSstore :: EVM t () = do
+                  _ <- accessStorageGasCost fees self x
+                  burn' (abstractGas "sstore" [WAddr self, x, new]) updateVMState
               in
-                whenSymbolicElse updateVMState concreteSstore
+                whenSymbolicElse symbolicSstore concreteSstore
             _ -> underrun
 
         OpTload -> {-# SCC "OpTload" #-}
@@ -913,7 +926,7 @@ exec1 conf = do
 
         OpMsize -> {-# SCC "OpMsize" #-}
           limitStack 1 . burn g_base $
-            next >> push (into vm.state.memorySize)
+            next >> pushSym vm.state.memorySize
 
         OpGas -> {-# SCC "OpGas" #-}
           limitStack 1 . burn g_base $
@@ -1198,14 +1211,14 @@ callChecks this xGas xContext xTo xValue xInOffset xInSize xOutOffset xOutSize x
                 assign (#state % #returndata) mempty
                 pushTrace $ ErrorTrace CallDepthLimitReached
                 next
-              else continue (toGas gas')
+              else continue gas'
         case (fromBal, xValue) of
           -- we're not transferring any value, and can skip the balance check
-          (_, Lit 0) -> burn (cost - gas') checkCallDepth
+          (_, Lit 0) -> burn' (subGas cost gas') checkCallDepth
 
           -- from is in the state, we check if they have enough balance
           (Just fb, _) -> do
-            burn (cost - gas') $
+            burn' (subGas cost gas') $
               branch (?conf).maxDepth (Expr.gt xValue fb) $ \case
                 True -> do
                   assign' (#state % #stack) (Lit 0 : xs)
@@ -1273,11 +1286,11 @@ executePrecompile preCompileAddr gasCap inOffset inSize outOffset outSize xs  = 
       notImplemented = whenSymbolicElse
         (partial $ PrecompileMissing {pc = vm.state.pc, addr = vm.state.contract, preAddr = preCompileAddr})
         (vmError $ NonexistentPrecompile preCompileAddr)
-      precompileFail = burn' (subGas gasCap cost) $ do
+      precompileFail = burn' (subGas gasCap (toGas cost)) $ do
                          assign' (#state % #stack) (Lit 0 : xs)
                          pushTrace $ ErrorTrace PrecompileFailure
                          next
-  if not (enoughGas cost gasCap) then
+  if not (enoughGas (toGas cost) gasCap) then
     burn' gasCap $ do
       assign' (#state % #stack) (Lit 0 : xs)
       next
@@ -1825,10 +1838,9 @@ selfdestruct = pushTo ((#tx % #subState) % #selfdestructs)
 
 accessAndBurn :: VMOps t => Expr EAddr -> EVM t () -> EVM t ()
 accessAndBurn x cont = do
-  FeeSchedule {..} <- use (#block % #schedule)
-  acc <- accessAccountForGas x
-  let cost = if acc then g_warm_storage_read else g_cold_account_access
-  burn cost cont
+  fees <- use (#block % #schedule)
+  cost <- accessAccountGasCost fees x
+  burn' cost cont
 
 -- | returns a wrapped boolean- if true, this address has been touched before in the txn (warm gas cost as in EIP 2929)
 -- otherwise cold
@@ -1841,7 +1853,7 @@ accessAccountForGas addr = do
 
 -- | returns a wrapped boolean- if true, this slot has been touched before in the txn (warm gas cost as in EIP 2929)
 -- otherwise cold
-accessStorageForGas :: Expr EAddr -> W256 -> EVM t Bool
+accessStorageForGas :: Expr EAddr -> Expr EWord -> EVM t Bool
 accessStorageForGas addr key = do
   accessedStrkeys <- use (#tx % #subState % #accessedStorageKeys)
   let accessed = member (addr, key) accessedStrkeys
@@ -2297,7 +2309,7 @@ delegateCall this gasGiven xTo xContext xValue xInOffset xInSize xOutOffset xOut
             assign #codeContract addr
             assign #stack mempty
             assign #memory newMemory
-            assign #memorySize 0
+            assign #memorySize (Lit 0)
             assign #returndata mempty
             assign #calldata calldata
             assign #overrideCaller Nothing
@@ -2664,11 +2676,12 @@ accessUnboundedMemoryRange
   -> EVM t ()
 accessUnboundedMemoryRange _ 0 continue = continue
 accessUnboundedMemoryRange f l continue = do
-  m0 <- use (#state % #memorySize)
+  m0Expr <- use (#state % #memorySize)
   fees <- gets (.block.schedule)
+  let m0 = fromMaybe (internalError "concrete memory size became symbolic") (maybeWord64 m0Expr)
   let m1 = 32 * ceilDiv (max m0 (f + l)) 32
   burn (memoryCost fees m1 - memoryCost fees m0) $ do
-    assign (#state % #memorySize) m1
+    assign (#state % #memorySize) (litGas m1)
     continue
 
 accessMemoryRange
@@ -2691,8 +2704,13 @@ accessMemoryRange (Lit offs) (Lit sz) continue =
         else if offs64 >= 0x0fffffff || sz64 >= 0x0fffffff
              then vmError IllegalOverflow
              else accessUnboundedMemoryRange offs64 sz64 continue
--- we just ignore gas if we get symbolic inputs
-accessMemoryRange _ _ continue = continue
+accessMemoryRange offs sz continue = do
+  m0 <- use (#state % #memorySize)
+  let m1 = Expr.max m0 (Expr.add offs sz)
+      cost = memoryExpansionGas m0 m1
+  burn' cost $ do
+    assign (#state % #memorySize) m1
+    continue
 
 accessMemoryWord
   :: VMOps t => Expr EWord -> EVM t () -> EVM t ()
@@ -3196,31 +3214,117 @@ freezeMemory :: MutableMemory -> EVM t (Expr Buf)
 freezeMemory memory =
   ConcreteBuf . vectorToByteString <$> VS.freeze memory
 
+litGas :: Word64 -> Expr EWord
+litGas = Lit . into
+
+opaqueGas :: Text -> [Expr EWord] -> Expr EWord
+opaqueGas label args = Expr.simplify $ GasCost label args
+
+maybeWord64 :: Expr EWord -> Maybe Word64
+maybeWord64 e = maybeLitWordSimp e >>= toWord64
+
+copyGas :: Word64 -> Word64 -> Expr EWord -> Expr EWord
+copyGas base wordCost size =
+  case maybeWord64 size of
+    Just size' -> litGas $ base + wordCost * ceilDiv size' 32
+    Nothing -> opaqueGas "copy" [litGas base, size]
 
 instance VMOps Symbolic where
-  burn' _ continue = continue
-  burnExp _ continue = continue
-  burnSha3 _ continue = continue
-  burnCalldatacopy _ continue = continue
-  burnCodecopy _ continue = continue
-  burnExtcodecopy _ _ continue = continue
-  burnReturndatacopy _ continue = continue
-  burnLog _ _ continue = continue
+  burn' cost continue = do
+    modifying (#state % #gas) (\gas -> Expr.simplify $ Expr.sub gas cost)
+    modifying #burned (\gas -> Expr.simplify $ Expr.add gas cost)
+    continue
 
-  initialGas = ()
+  burnExp exponent continue = do
+    FeeSchedule {..} <- gets (.block.schedule)
+    let cost = case maybeLitWordSimp exponent of
+          Just 0 -> litGas g_exp
+          Just exponent' -> litGas $ g_exp + g_expbyte * unsafeInto (ceilDiv (1 + log2 exponent') 8)
+          Nothing -> opaqueGas "exp" [exponent]
+    burn' cost continue
+
+  burnSha3 xSize continue = do
+    FeeSchedule {..} <- gets (.block.schedule)
+    let cost = case maybeWord64 xSize of
+          Just size -> litGas $ g_sha3 + g_sha3word * ceilDiv size 32
+          Nothing -> opaqueGas "sha3" [xSize]
+    burn' cost continue
+
+  burnCalldatacopy xSize continue = do
+    FeeSchedule {..} <- gets (.block.schedule)
+    burn' (copyGas g_verylow g_copy xSize) continue
+
+  burnCodecopy n continue = do
+    FeeSchedule {..} <- gets (.block.schedule)
+    burn' (copyGas g_verylow g_copy n) continue
+
+  burnExtcodecopy extAccount codeSize continue = do
+    fees@FeeSchedule {..} <- gets (.block.schedule)
+    accessCost <- accessAccountGasCost fees extAccount
+    let copyCost = case maybeWord64 codeSize of
+          Just size -> litGas $ g_copy * ceilDiv size 32
+          Nothing -> opaqueGas "extcodecopy" [WAddr extAccount, codeSize]
+    burn' (Expr.add accessCost copyCost) continue
+
+  burnReturndatacopy xSize continue = do
+    FeeSchedule {..} <- gets (.block.schedule)
+    burn' (copyGas g_verylow g_copy xSize) continue
+
+  burnLog xSize n continue = do
+    FeeSchedule {..} <- gets (.block.schedule)
+    let cost = case maybeWord64 xSize of
+          Just size -> litGas $ g_log + g_logdata * size + fromIntegral n * g_logtopic
+          Nothing -> opaqueGas "log" [xSize, litGas (fromIntegral n)]
+    burn' cost continue
+
+  initialGas = (Var "Gas")
+  initialBurnedGas = Lit 0
   ensureGas _ continue = continue
-  gasTryFrom _ = Right ()
-  costOfCreate _ _ _ _ = ((), ())
-  costOfCall _ _ _ _ _ _ continue = continue 0 0
-  reclaimRemainingGasAllowance _ = pure ()
+  gasTryFrom g = Right g
+  costOfCreate FeeSchedule {..} availableGas size hashNeeded = (createCost, initGas)
+    where
+      byteCost = if hashNeeded then g_sha3word + g_initcodeword else g_initcodeword
+      createCost = case maybeWord64 size of
+        Just size' -> litGas $ g_create + byteCost * ceilDiv size' 32
+        Nothing -> opaqueGas "createCost" [size, litGas byteCost]
+      initGas = case (availableGas, createCost) of
+        (Lit available, Lit cost) ->
+          case (toWord64 available, toWord64 cost) of
+            (Just available', Just cost') -> litGas $ allButOne64th (available' - cost')
+            _ -> opaqueGas "createInitGas" [availableGas, createCost]
+        _ -> opaqueGas "createInitGas" [availableGas, createCost]
+  costOfCall fees _ xValue availableGas xGas target continue = do
+    accessCost <- accessAccountGasCost fees target
+    continue
+      (opaqueGas "callCost" [xValue, availableGas, xGas, WAddr target, accessCost])
+      (opaqueGas "callGas" [xValue, availableGas, xGas, WAddr target])
+  accessAccountGasCost FeeSchedule {..} addr = do
+    accessed <- accessAccountForGas addr
+    pure $ if accessed
+      then litGas g_warm_storage_read
+      else case addr of
+        LitAddr _ -> litGas g_cold_account_access
+        _ -> opaqueGas "accountAccess" [WAddr addr]
+  accessStorageGasCost FeeSchedule {..} addr key = do
+    accessed <- accessStorageForGas addr key
+    pure $ if accessed
+      then litGas g_warm_storage_read
+      else case key of
+        Lit _ -> litGas g_cold_sload
+        _ -> opaqueGas "storageAccess" [WAddr addr, key]
+  reclaimRemainingGasAllowance oldVm = do
+    let remainingGas = oldVm.state.gas
+    modifying #burned (\gas -> Expr.simplify $ Expr.sub gas remainingGas)
+    modifying (#state % #gas) (\gas -> Expr.simplify $ Expr.add gas remainingGas)
   payRefunds = pure ()
   pushGas = do
-    modifying (#env % #freshGasVals) (+ 1)
-    n <- use (#env % #freshGasVals)
-    pushSym $ Expr.Gas "" n
+    gas <- use (#state % #gas)
+    pushSym gas
   enoughGas _ _ = True
-  subGas _ _ = ()
-  toGas _ = ()
+  subGas = Expr.sub
+  toGas c = Lit (into c)
+  abstractGas = opaqueGas
+  memoryExpansionGas old new = Expr.simplify $ Expr.sub (MemoryGasCost new) (MemoryGasCost old)
   whenSymbolicElse a _ = a
 
   partial e = assign #result $ Just (Unfinished e)
@@ -3326,6 +3430,7 @@ instance VMOps Concrete where
       _ -> vmError IllegalOverflow
 
   initialGas = 0
+  initialBurnedGas = 0
 
   ensureGas amount continue = do
     availableGas <- use (#state % #gas)
@@ -3365,6 +3470,14 @@ instance VMOps Concrete where
         c_callgas = if xValue /= 0 then c_gascap + g_callstipend else c_gascap
     let (cost, gas') = (c_gascap + c_extra, c_callgas)
     continue cost gas'
+
+  accessAccountGasCost FeeSchedule {..} addr = do
+    acc <- accessAccountForGas addr
+    pure $ if acc then g_warm_storage_read else g_cold_account_access
+
+  accessStorageGasCost FeeSchedule {..} addr key = do
+    acc <- accessStorageForGas addr key
+    pure $ if acc then g_warm_storage_read else g_cold_sload
 
   -- When entering a call, the gas allowance is counted as burned
   -- in advance; this unburns the remainder and adds it to the
@@ -3407,6 +3520,8 @@ instance VMOps Concrete where
   enoughGas cost gasCap = cost <= gasCap
   subGas gasCap cost = gasCap - cost
   toGas = id
+  abstractGas _ _ = 0
+  memoryExpansionGas _ _ = 0
   whenSymbolicElse _ a = a
   partial _ = internalError "won't happen during concrete exec"
   branch _ (forceLit -> cond) continue = continue (cond > 0)
@@ -3418,11 +3533,11 @@ symbolify vm =
   vm { result = symbolifyResult <$> vm.result
      , state  = symbolifyFrameState vm.state
      , frames = symbolifyFrame <$> vm.frames
-     , burned = ()
+     , burned = Lit (into vm.burned)
      }
 
 symbolifyFrameState :: FrameState Concrete -> FrameState Symbolic
-symbolifyFrameState state = state { gas = () }
+symbolifyFrameState state = state { gas = Lit (into state.gas) }
 
 symbolifyFrame :: Frame Concrete -> Frame Symbolic
 symbolifyFrame frame = frame { state = symbolifyFrameState frame.state }

@@ -660,6 +660,8 @@ formatExpr = go
       e@BaseFee -> T.pack (show e)
       e@TxValue -> T.pack (show e)
       e@(Gas {}) -> "(" <> T.pack (show e) <> ")"
+      GasCost label args -> fmt ("GasCost " <> label) args
+      MemoryGasCost size -> fmt "MemoryGasCost" [size]
 
       BlockHash a -> fmt "BlockHash" [a]
       Balance a -> fmt "Balance" [a]

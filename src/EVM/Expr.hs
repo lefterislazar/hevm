@@ -1186,6 +1186,15 @@ simplifyNoLitToKeccak e = untilFixpoint (mapExpr go) e
     -- sub + add NOTE: every combination of Sub is needed (2)
     go (Sub (Lit x) (Add (Lit y) orig)) = sub (Lit (x-y)) orig
     go (Sub (Add (Lit x) orig) (Lit y) ) = add (Lit (x-y)) orig
+    -- symbolic telescoping, useful for accumulated gas deltas:
+    -- (a - b) + (b - c) = a - c
+    go (Add (Sub a b) c)
+      | b == c = a
+    go (Add a (Sub b c))
+      | a == c = b
+    go (Add (Sub a b) (Sub c d))
+      | b == c = sub a d
+      | a == d = sub c b
 
     -- Add+Add / Mul+Mul / Xor+Xor simplifications, taking
     --     advantage of associativity and commutativity
@@ -1305,6 +1314,8 @@ simplifyNoLitToKeccak e = untilFixpoint (mapExpr go) e
     go (Min a b) = case (a, b) of
                      (Lit 0, _) -> Lit 0
                      _ -> EVM.Expr.min a b
+    go (MemoryGasCost (Lit 0)) = Lit 0
+    go (MemoryGasCost size) = MemoryGasCost size
 
 
     -- Some trivial mul eliminations

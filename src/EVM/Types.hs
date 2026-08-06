@@ -301,6 +301,13 @@ data Expr (a :: EType) where
                  -> Int                -- fresh gas variable
                  -> Expr EWord
 
+  GasCost        :: Text               -- opaque gas-cost category
+                 -> [Expr EWord]       -- provenance inputs
+                 -> Expr EWord
+
+  MemoryGasCost  :: Expr EWord         -- memory size in bytes
+                 -> Expr EWord
+
   -- code
 
   CodeSize       :: Expr EAddr         -- address
@@ -678,7 +685,7 @@ defaultMergeState = MergeState False 0
 data VMType = Symbolic | Concrete
 
 type family Gas (t :: VMType) = r | r -> t where
-  Gas Symbolic = ()
+  Gas Symbolic = Expr EWord
   Gas Concrete = Word64
 
 -- | The state of a stepwise EVM execution
@@ -786,7 +793,7 @@ data SubState = SubState
   { selfdestructs       :: [Expr EAddr]
   , touchedAccounts     :: [Expr EAddr]
   , accessedAddresses   :: Set (Expr EAddr)
-  , accessedStorageKeys :: Set (Expr EAddr, W256)
+  , accessedStorageKeys :: Set (Expr EAddr, Expr EWord)
   , refunds             :: [(Expr EAddr, Word64)]
   , createdContracts    :: Set (Expr EAddr)
   -- in principle we should include logs here, but do not for now
@@ -801,7 +808,7 @@ data FrameState (t :: VMType) = FrameState
   , pc           :: {-# UNPACK #-} !Int -- program counter in BYTES (not ops). PUSH ops will increment pc by more than 1
   , stack        :: [Expr EWord]
   , memory       :: Memory
-  , memorySize   :: Word64
+  , memorySize   :: Expr EWord
   , calldata     :: Expr Buf
   , callvalue    :: Expr EWord
   , caller       :: Expr EAddr
@@ -889,6 +896,7 @@ class VMOps (t :: VMType) where
   burnLog :: Expr EWord -> Word8 -> EVM t () -> EVM t ()
 
   initialGas :: Gas t
+  initialBurnedGas :: Gas t
   ensureGas :: Word64 -> EVM t () -> EVM t ()
   -- TODO: change to EvmWord t
   gasTryFrom :: Expr EWord -> Either () (Gas t)
@@ -898,14 +906,18 @@ class VMOps (t :: VMType) where
 
   costOfCall
     :: FeeSchedule Word64 -> Bool -> Expr EWord -> Gas t -> Gas t -> Expr EAddr
-    -> (Word64 -> Word64 -> EVM t ()) -> EVM t ()
+    -> (Gas t -> Gas t -> EVM t ()) -> EVM t ()
 
+  accessAccountGasCost :: FeeSchedule Word64 -> Expr EAddr -> EVM t (Gas t)
+  accessStorageGasCost :: FeeSchedule Word64 -> Expr EAddr -> Expr EWord -> EVM t (Gas t)
   reclaimRemainingGasAllowance :: VM t -> EVM t ()
   payRefunds :: EVM t ()
   pushGas :: EVM t ()
-  enoughGas :: Word64 -> Gas t -> Bool
-  subGas :: Gas t -> Word64 -> Gas t
+  enoughGas :: Gas t -> Gas t -> Bool
+  subGas :: Gas t -> Gas t -> Gas t
   toGas :: Word64 -> Gas t
+  abstractGas :: Text -> [Expr EWord] -> Gas t
+  memoryExpansionGas :: Expr EWord -> Expr EWord -> Gas t
 
   whenSymbolicElse :: EVM t a -> EVM t a -> EVM t a
 

@@ -23,7 +23,7 @@ import Control.Monad.State.Strict (StateT(..))
 import Control.Monad.Operational qualified as Operational
 import Control.Monad.Reader (lift)
 import Control.Monad.State.Strict qualified as State
-import Data.Maybe (fromJust)
+import Data.Maybe (fromJust, fromMaybe)
 import EVM (exec1)
 import EVM.Op (intToOpName)
 import Witch (into)
@@ -130,7 +130,9 @@ interpretWithTrace fetcher =
 vmTraceStep :: VM Concrete -> VMTraceStep
 vmTraceStep vm =
   let
-    memsize = vm.state.memorySize
+    memsize = case vm.state.memorySize of
+      Lit n -> fromMaybe (internalError "concrete memory size overflow") (toWord64 n)
+      _ -> internalError "concrete memory size became symbolic"
   in VMTraceStep
     { pc = vm.state.pc
     , op = into $ getOpFromVM vm
@@ -158,4 +160,3 @@ getOpFromVM vm =
         RuntimeCode (SymbolicRuntimeCode _) -> internalError "RuntimeCode is symbolic"
   in if xs == BS.empty then 0
                        else BS.head xs
-

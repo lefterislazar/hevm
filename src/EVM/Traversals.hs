@@ -159,6 +159,8 @@ foldExpr f acc expr = acc <> (go expr)
       -- frame context
 
       e@(Gas _ _) -> f e
+      e@(GasCost _ args) -> f e <> foldMap go args
+      e@(MemoryGasCost size) -> f e <> go size
       e@(Balance {}) -> f e
 
       -- code
@@ -516,6 +518,12 @@ mapExprM f expr = case expr of
   -- frame context
 
   Gas a b -> f (Gas a b)
+  GasCost a b -> do
+    b' <- mapM (mapExprM f) b
+    f (GasCost a b')
+  MemoryGasCost a -> do
+    a' <- mapExprM f a
+    f (MemoryGasCost a')
   Balance a -> do
     a' <- mapExprM f a
     f (Balance a')
