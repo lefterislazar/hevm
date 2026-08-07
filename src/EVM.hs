@@ -926,7 +926,9 @@ exec1 conf = do
 
         OpMsize -> {-# SCC "OpMsize" #-}
           limitStack 1 . burn g_base $
-            next >> pushSym vm.state.memorySize
+            next >> whenSymbolicElse
+              (pushSym (Expr.simplify $ Expr.mul vm.state.memorySize (Lit 32)))
+              (pushSym vm.state.memorySize)
 
         OpGas -> {-# SCC "OpGas" #-}
           limitStack 1 . burn g_base $
@@ -1282,19 +1284,19 @@ executePrecompile preCompileAddr gasCap inOffset inSize outOffset outSize xs  = 
   vm <- get
   input <- readMemory inOffset inSize
   let fees = vm.block.schedule
-      cost = costOfPrecompile fees preCompileAddr input
+      cost = precompileGasCost fees preCompileAddr input
       notImplemented = whenSymbolicElse
         (partial $ PrecompileMissing {pc = vm.state.pc, addr = vm.state.contract, preAddr = preCompileAddr})
         (vmError $ NonexistentPrecompile preCompileAddr)
-      precompileFail = burn' (subGas gasCap (toGas cost)) $ do
+      precompileFail = burn' (subGas gasCap cost) $ do
                          assign' (#state % #stack) (Lit 0 : xs)
                          pushTrace $ ErrorTrace PrecompileFailure
                          next
-  if not (enoughGas (toGas cost) gasCap) then
+  if not (enoughGas cost gasCap) then
     burn' gasCap $ do
       assign' (#state % #stack) (Lit 0 : xs)
       next
-  else burn cost $
+  else burn' cost $
     case preCompileAddr of
       -- ECRECOVER
       0x1 ->
@@ -2691,30 +2693,39 @@ accessMemoryRange
   -> EVM t ()
   -> EVM t ()
 accessMemoryRange _ (Lit 0) continue = continue
-accessMemoryRange (Lit offs) (Lit sz) continue =
-  case (,) <$> toWord64 offs <*> toWord64 sz of
-    Nothing -> vmError IllegalOverflow
-    Just (offs64, sz64) ->
-      if offs64 + sz64 < sz64
-        then vmError IllegalOverflow
-        -- we need to limit these to <256MB because otherwise we could run out of memory
-        -- in e.g. OpCalldatacopy and subsequent memory allocation when running with abstract gas.
-        -- In these cases, the system would try to allocate a large (but <2**64 bytes) memory
-        -- that leads to out-of-heap. Real-world scenarios cannot allocate 256MB of memory due to gas
-        else if offs64 >= 0x0fffffff || sz64 >= 0x0fffffff
-             then vmError IllegalOverflow
-             else accessUnboundedMemoryRange offs64 sz64 continue
 accessMemoryRange offs sz continue = do
-  m0 <- use (#state % #memorySize)
-  let m1 = Expr.max m0 (Expr.add offs sz)
-      cost = memoryExpansionGas m0 m1
-  burn' cost $ do
-    assign (#state % #memorySize) m1
-    continue
+  let symbolicAccess = do
+        m0 <- use (#state % #memorySize)
+        let m1 = Expr.max m0 (activeWords offs sz)
+            cost = memoryExpansionGas m0 m1
+        burn' cost $ do
+          assign (#state % #memorySize) m1
+          continue
+      concreteAccess =
+        case (offs, sz) of
+          (Lit offs', Lit sz') ->
+            case (,) <$> toWord64 offs' <*> toWord64 sz' of
+              Nothing -> vmError IllegalOverflow
+              Just (offs64, sz64) ->
+                if offs64 + sz64 < sz64
+                  then vmError IllegalOverflow
+                  -- we need to limit these to <256MB because otherwise we could run out of memory
+                  -- in e.g. OpCalldatacopy and subsequent memory allocation when running with abstract gas.
+                  -- In these cases, the system would try to allocate a large (but <2**64 bytes) memory
+                  -- that leads to out-of-heap. Real-world scenarios cannot allocate 256MB of memory due to gas
+                  else if offs64 >= 0x0fffffff || sz64 >= 0x0fffffff
+                       then vmError IllegalOverflow
+                       else accessUnboundedMemoryRange offs64 sz64 continue
+          _ -> vmError IllegalOverflow
+  whenSymbolicElse symbolicAccess concreteAccess
 
 accessMemoryWord
   :: VMOps t => Expr EWord -> EVM t () -> EVM t ()
 accessMemoryWord x = accessMemoryRange x (Lit 32)
+
+activeWords :: Expr EWord -> Expr EWord -> Expr EWord
+activeWords offs sz =
+  Expr.div (Expr.add (Expr.add offs sz) (Lit 31)) (Lit 32)
 
 copyBytesToMemory
   :: Expr Buf -> Expr EWord -> Expr EWord -> Expr EWord -> EVM t ()
@@ -2724,16 +2735,22 @@ copyBytesToMemory bs size srcOffset memOffset =
     gets (.state.memory) >>= \case
       ConcreteMemory mem ->
         case (bs, size, srcOffset, memOffset) of
-          (ConcreteBuf b, Lit size', Lit srcOffset', Lit memOffset') -> do
-            let src =
-                  if srcOffset' >= unsafeInto (BS.length b) then
-                    BS.replicate (unsafeInto size') 0
-                  else
-                    BS.take (unsafeInto size') $
-                    padRight (unsafeInto size') $
-                    BS.drop (unsafeInto srcOffset') b
+          (ConcreteBuf b, Lit size', Lit srcOffset', Lit memOffset')
+            | Just size64 <- toWord64 size'
+            , Just srcOffset64 <- toWord64 srcOffset'
+            , Just memOffset64 <- toWord64 memOffset'
+            , size64 <= fromIntegral (maxBound :: Int)
+            , srcOffset64 <= fromIntegral (maxBound :: Int)
+            , memOffset64 <= fromIntegral (maxBound :: Int) -> do
+                let src =
+                      if srcOffset64 >= fromIntegral (BS.length b) then
+                        BS.replicate (unsafeInto size64) 0
+                      else
+                        BS.take (unsafeInto size64) $
+                        padRight (unsafeInto size64) $
+                        BS.drop (unsafeInto srcOffset64) b
 
-            writeMemory mem (unsafeInto memOffset') src
+                writeMemory mem (unsafeInto memOffset64) src
           _ -> do
             -- copy out and move to symbolic memory
             buf <- freezeMemory mem
@@ -2755,9 +2772,10 @@ readMemory offset' size' = do
       case (offset', size') of
         (Lit offset, Lit size) -> do
           let memSize :: Word64 = unsafeInto (VS.Mutable.length mem)
-          if size > Expr.maxBytes ||
-             offset + size > Expr.maxBytes ||
-             offset >= into memSize then
+          if size > Expr.maxBytes || offset + size > Expr.maxBytes then do
+            buf <- freezeMemory mem
+            pure $ copySlice offset' (Lit 0) size' buf (ConcreteBuf "")
+          else if offset >= into memSize then
             -- reads past memory are all zeros
             pure $ ConcreteBuf $ BS.replicate (unsafeInto size) 0
           else do
@@ -3312,6 +3330,15 @@ instance VMOps Symbolic where
       else case key of
         Lit _ -> litGas g_cold_sload
         _ -> opaqueGas "storageAccess" [WAddr addr, key]
+  precompileGasCost fees precompileAddr input =
+    case (precompileAddr, maybeWord64 (bufLength input)) of
+      (0x1, _) -> litGas 3000
+      (0x6, _) -> litGas fees.g_ecadd
+      (0x7, _) -> litGas fees.g_ecmul
+      (_, Just _) -> case input of
+        ConcreteBuf _ -> litGas (costOfPrecompile fees precompileAddr input)
+        _ -> opaqueGas "precompile" [Lit (into precompileAddr), bufLength input]
+      _ -> opaqueGas "precompile" [Lit (into precompileAddr), bufLength input]
   reclaimRemainingGasAllowance oldVm = do
     let remainingGas = oldVm.state.gas
     modifying #burned (\gas -> Expr.simplify $ Expr.sub gas remainingGas)
@@ -3478,6 +3505,8 @@ instance VMOps Concrete where
   accessStorageGasCost FeeSchedule {..} addr key = do
     acc <- accessStorageForGas addr key
     pure $ if acc then g_warm_storage_read else g_cold_sload
+
+  precompileGasCost = costOfPrecompile
 
   -- When entering a call, the gas allowance is counted as burned
   -- in advance; this unburns the remainder and adds it to the

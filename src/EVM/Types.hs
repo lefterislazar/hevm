@@ -305,7 +305,7 @@ data Expr (a :: EType) where
                  -> [Expr EWord]       -- provenance inputs
                  -> Expr EWord
 
-  MemoryGasCost  :: Expr EWord         -- memory size in bytes
+  MemoryGasCost  :: Expr EWord         -- active memory words
                  -> Expr EWord
 
   -- code
@@ -910,6 +910,7 @@ class VMOps (t :: VMType) where
 
   accessAccountGasCost :: FeeSchedule Word64 -> Expr EAddr -> EVM t (Gas t)
   accessStorageGasCost :: FeeSchedule Word64 -> Expr EAddr -> Expr EWord -> EVM t (Gas t)
+  precompileGasCost :: FeeSchedule Word64 -> Addr -> Expr Buf -> Gas t
   reclaimRemainingGasAllowance :: VM t -> EVM t ()
   payRefunds :: EVM t ()
   pushGas :: EVM t ()
