@@ -164,6 +164,7 @@ deriving instance Ord (GVar a)
   Bufs have two base constructors:
     - AbstractBuf:    all elements are fully abstract values
     - ConcreteBuf bs: all elements past (length bs) are zero
+    - SymbolicBuf bs: a finite symbolic byte vector, with zeroes past its length
 
   Bufs can be read from with:
     - ReadByte idx buf: read the byte at idx from buf
@@ -212,6 +213,7 @@ data Expr (a :: EType) where
 
   -- bytes
 
+  ByteAt         :: Expr EWord -> Expr EWord -> Expr EWord
   LitByte        :: {-# UNPACK #-} !Word8 -> Expr Byte
   IndexWord      :: Expr EWord -> Expr EWord -> Expr Byte
   EqByte         :: Expr Byte  -> Expr Byte  -> Expr EWord
@@ -365,8 +367,14 @@ data Expr (a :: EType) where
 
   ConcreteBuf    :: ByteString -> Expr Buf
   AbstractBuf    :: Text -> Expr Buf
+  SymbolicBuf    :: V.Vector (Expr Byte) -> Expr Buf
 
   ReadWord       :: Expr EWord         -- index
+                 -> Expr Buf           -- src
+                 -> Expr EWord
+
+  ReadBytes      :: Int                -- number of bytes to read
+                 -> Expr EWord         -- index
                  -> Expr Buf           -- src
                  -> Expr EWord
 
@@ -1565,8 +1573,7 @@ word32 xs = sum [ into x `shiftL` (8*n)
                 | (n, x) <- zip [0..] (reverse xs) ]
 
 keccak :: Expr Buf -> Expr EWord
-keccak (ConcreteBuf bs) = Lit $ keccak' bs
-keccak buf = Keccak buf
+keccak = Keccak
 
 keccak' :: ByteString -> W256
 keccak' = keccakBytes >>> BS.take 32 >>> word

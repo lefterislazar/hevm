@@ -12,7 +12,7 @@ import Optics.Zoom
 
 import EVM.ABI
 import EVM.Expr (readStorage, concStoreContains, writeStorage, readByte, readWord, writeWord,
-  writeByte, bufLength, indexWord, readBytes, copySlice, wordToAddr, maybeLitByteSimp, maybeLitWordSimp, maybeLitAddrSimp)
+  writeByte, bufLength, indexWord, readBytes, copySlice, wordToAddr, maybeLitByteSimp, maybeLitWordSimp, maybeLitAddrSimp, byteAt)
 import EVM.Expr qualified as Expr
 import EVM.FeeSchedule (FeeSchedule (..))
 import EVM.FeeSchedule qualified as Fees (feeSchedule)
@@ -479,7 +479,7 @@ exec1 conf = do
         OpXor -> {-# SCC "OpXor" #-} stackOp2 g_verylow Expr.xor
         OpNot -> {-# SCC "OpNot" #-} stackOp1 g_verylow Expr.not
 
-        OpByte -> {-# SCC "OpByte" #-} stackOp2 g_verylow (\i w -> Expr.padByte $ Expr.indexWord i w)
+        OpByte -> {-# SCC "OpByte" #-} stackOp2 g_verylow byteAt
 
         OpShl -> {-# SCC "OpShl" #-} stackOp2 g_verylow Expr.shl
         OpShr -> {-# SCC "OpShr" #-} stackOp2 g_verylow Expr.shr
@@ -492,16 +492,7 @@ exec1 conf = do
             xOffset:xSize:xs ->
               burnSha3 xSize $
                 accessMemoryRange xOffset xSize $ do
-                  hash <- readMemory xOffset xSize >>= \case
-                    orig@(ConcreteBuf bs) ->
-                      whenSymbolicElse
-                        (pure $ Keccak orig)
-                        (do
-                          let kc = keccak' bs
-                          modifying #keccakPreImgs (insert (bs, kc))
-                          pure $ Lit kc
-                        )
-                    buf -> pure $ Keccak buf
+                  hash <- Keccak <$> readMemory xOffset xSize
                   next
                   assign' (#state % #stack) (hash : xs)
             _ -> underrun

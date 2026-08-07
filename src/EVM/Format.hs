@@ -585,6 +585,16 @@ formatExpr = go
         , ")"
         ]
 
+      ByteAt idx val -> T.unlines
+        [ "(ByteAt"
+        , indent 2 $ T.unlines
+          [ "idx:"
+          , indent 2 $ formatExpr idx
+          , "val: "
+          , indent 2 $ formatExpr val
+          ]
+        , ")"
+        ]
       IndexWord idx val -> T.unlines
         [ "(IndexWord"
         , indent 2 $ T.unlines
@@ -597,6 +607,16 @@ formatExpr = go
         ]
       ReadWord idx buf -> T.unlines
         [ "(ReadWord"
+        , indent 2 $ T.unlines
+          [ "idx:"
+          , indent 2 $ formatExpr idx
+          , "buf: "
+          , indent 2 $ formatExpr buf
+          ]
+        , ")"
+        ]
+      ReadBytes n idx buf -> T.unlines
+        [ "(ReadBytes " <> T.pack (show n)
         , indent 2 $ T.unlines
           [ "idx:"
           , indent 2 $ formatExpr idx
@@ -823,6 +843,11 @@ formatExpr = go
           , ")"
           ]
       b@(AbstractBuf _) -> "(" <> T.pack (show b) <> ")"
+      SymbolicBuf bs -> T.unlines
+        [ "(SymbolicBuf"
+        , indent 2 $ T.unlines $ fmap formatExpr (toList bs)
+        , ")"
+        ]
 
       -- Hashes
       Keccak b -> fmt "Keccak" [b]

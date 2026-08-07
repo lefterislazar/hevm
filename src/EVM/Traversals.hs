@@ -66,6 +66,7 @@ foldExpr f acc expr = acc <> (go expr)
 
       -- bytes
 
+      e@(ByteAt a b) -> f e <> (go a) <> (go b)
       e@(IndexWord a b) -> f e <> (go a) <> (go b)
       e@(EqByte a b) -> f e <> (go a) <> (go b)
 
@@ -139,6 +140,7 @@ foldExpr f acc expr = acc <> (go expr)
       -- Hashes
 
       e@(Keccak a) -> f e <> (go a)
+      e@(ReadBytes _ a b) -> f e <> (go a) <> (go b)
 
       -- block context
 
@@ -189,6 +191,7 @@ foldExpr f acc expr = acc <> (go expr)
 
       e@(ConcreteBuf _) -> f e
       e@(AbstractBuf _) -> f e
+      e@(SymbolicBuf bs) -> f e <> foldMap go bs
       e@(ReadWord a b) -> f e <> (go a) <> (go b)
       e@(ReadByte a b) -> f e <> (go a) <> (go b)
       e@(WriteWord a b c) -> f e <> (go a) <> (go b) <> (go c)
@@ -291,6 +294,10 @@ mapExprM f expr = case expr of
 
   -- bytes
 
+  ByteAt a b -> do
+    a' <- mapExprM f a
+    b' <- mapExprM f b
+    f (ByteAt a' b')
   IndexWord a b -> do
     a' <- mapExprM f a
     b' <- mapExprM f b
@@ -496,6 +503,10 @@ mapExprM f expr = case expr of
   Keccak a -> do
     a' <- mapExprM f a
     f (Keccak a')
+  ReadBytes n a b -> do
+    a' <- mapExprM f a
+    b' <- mapExprM f b
+    f (ReadBytes n a' b')
 
   -- block context
 
@@ -565,6 +576,9 @@ mapExprM f expr = case expr of
     f (ConcreteBuf a)
   AbstractBuf a -> do
     f (AbstractBuf a)
+  SymbolicBuf a -> do
+    a' <- mapM (mapExprM f) a
+    f (SymbolicBuf a')
   ReadWord a b -> do
     a' <- mapExprM f a
     b' <- mapExprM f b

@@ -181,16 +181,7 @@ shl = op2 SHL (\x y -> if x >= 256 then 0 else shiftL y (fromIntegral x))
 
 shr :: Expr EWord -> Expr EWord -> Expr EWord
 shr = op2
-  (\x y -> case (x, y) of
-             -- simplify function selector checks
-             (Lit 0xe0, ReadWord (Lit idx) buf)
-               -> joinBytes (
-                    replicate 28 (LitByte 0) <>
-                      [ readByte (Lit idx) buf
-                      , readByte (Lit $ idx + 1) buf
-                      , readByte (Lit $ idx + 2) buf
-                      , readByte (Lit $ idx + 3) buf])
-             _ -> SHR x y)
+  SHR
   (\x y -> if x > 256 then 0 else shiftR y (fromIntegral x))
 
 sar :: Expr EWord -> Expr EWord -> Expr EWord
@@ -244,6 +235,14 @@ readByte (Lit x) (ConcreteBuf b)
     i :: Int
     i = case x of
           (W256 (Word256 _ (Word128 _ x'))) -> unsafeInto x'
+readByte (Lit x) (SymbolicBuf b)
+  = if x <= unsafeInto (maxBound :: Int) && i < V.length b
+    then b V.! i
+    else LitByte 0x0
+  where
+    i :: Int
+    i = case x of
+          (W256 (Word256 _ (Word128 _ x'))) -> unsafeInto x'
 
 readByte i@(Lit x) (WriteByte (Lit idx) val src)
   = if x == idx
@@ -279,7 +278,15 @@ readByte i buf = ReadByte i buf
 -- If n is >= 32 this is the same as readWord
 readBytes :: Int -> Expr EWord -> Expr Buf -> Expr EWord
 readBytes (Prelude.min 32 -> n) idx buf
-  = joinBytes [readByte (add idx (Lit . unsafeInto $ i)) buf | i <- [0 .. n - 1]]
+  | n == 32 = readWord idx buf
+  | otherwise =
+      let bytes = [readByte (add idx (Lit . unsafeInto $ i)) buf | i <- [0 .. n - 1]]
+      in if all isLitByte bytes
+         then joinBytes bytes
+         -- TODO: Symbolic-preserving reads avoid early byte decomposition, so
+         -- simplification rules may need to be strengthened around ReadBytes,
+         -- ByteAt, WriteWord, CopySlice, and selector extraction.
+         else ReadBytes n idx buf
 
 -- | Reads the word starting at idx from the given buf
 readWord :: Expr EWord -> Expr Buf -> Expr EWord
@@ -318,12 +325,15 @@ readWordFromBytes (Lit idx) (ConcreteBuf bs) =
   case tryInto idx of
     Left _ -> Lit 0
     Right i -> Lit $ word $ padRight 32 $ BS.take 32 $ BS.drop i bs
+readWordFromBytes (Lit idx) (SymbolicBuf bs)
+  | idx <= unsafeInto (maxBound :: Int) =
+      let bytes = [readByte (Lit i') (SymbolicBuf bs) | i' <- [idx .. idx + 31]]
+      in if all isLitByte bytes
+         then Lit (bytesToW256 . mapMaybe maybeLitByteSimp $ bytes)
+         else ReadWord (Lit idx) (SymbolicBuf bs)
+  | otherwise = Lit 0
 readWordFromBytes idx buf@(AbstractBuf _) = ReadWord idx buf
-readWordFromBytes i@(Lit idx) buf = let
-    bytes = [readByte (Lit i') buf | i' <- [idx .. idx + 31]]
-  in if all isLitByte bytes
-     then Lit (bytesToW256 . mapMaybe maybeLitByteSimp $ bytes)
-     else ReadWord i buf
+readWordFromBytes i@(Lit _) buf = ReadWord i buf
 readWordFromBytes idx buf = ReadWord idx buf
 
 {- | Copies a slice of src into dst.
@@ -368,21 +378,6 @@ copySlice a@(Lit srcOffset) b@(Lit dstOffset) c@(Lit size) d@(ConcreteBuf src) e
           tl = BS.drop (unsafeInto dstOffset + unsafeInto size) dst
       in ConcreteBuf $ hd <> sl <> tl
   | otherwise = CopySlice a b c d e
-
--- concrete indices & abstract src (may produce a concrete result if we are
--- copying from a concrete region of src)
-copySlice s@(Lit srcOffset) d@(Lit dstOffset) sz@(Lit size) src ds@(ConcreteBuf dst)
-  | dstOffset < maxBytes, size < maxBytes, srcOffset + (size-1) > srcOffset = let
-    hd = padRight (unsafeInto dstOffset) $ BS.take (unsafeInto dstOffset) dst
-    sl = [readByte (Lit i) src | i <- [srcOffset .. srcOffset + (size - 1)]]
-    tl = BS.drop (unsafeInto dstOffset + unsafeInto size) dst
-    in if all isLitByte sl
-       then ConcreteBuf $ hd <> (BS.pack . (mapMaybe maybeLitByteSimp) $ sl) <> tl
-       else CopySlice s d sz src ds
-  | otherwise = CopySlice s d sz src ds
-
-copySlice srcOff dstOff (Lit size) (WriteWord srcOff2 val _) dstBuff
-  | size < 32 && srcOff == srcOff2 = copySlice (Lit 0) dstOff (Lit size) (WriteWord (Lit 0) val (ConcreteBuf "")) dstBuff
 
 -- abstract indices
 copySlice srcOffset dstOffset size src dst = CopySlice srcOffset dstOffset size src dst
@@ -451,6 +446,7 @@ bufLengthEnv env useEnv buf = go (Lit 0) buf
     go :: Expr EWord -> Expr Buf -> Expr EWord
     go l (ConcreteBuf b) = EVM.Expr.max l (Lit (unsafeInto . BS.length $ b))
     go l (AbstractBuf b) = EVM.Expr.max l (BufLength (AbstractBuf b))
+    go l (SymbolicBuf b) = EVM.Expr.max l (Lit (unsafeInto . V.length $ b))
     go l (WriteWord idx _ b) = go (EVM.Expr.max l (add idx (Lit 32))) b
     go l (WriteByte idx _ b) = go (EVM.Expr.max l (add idx (Lit 1))) b
     go l (CopySlice _ _ (Lit 0) _ dst) = go l dst
@@ -472,6 +468,7 @@ minLength bufEnv = go 0
     -- base cases
     go l (AbstractBuf _) = if l == 0 then Nothing else Just $ into l
     go l (ConcreteBuf b) = Just . into $ Prelude.max (unsafeInto . BS.length $ b) l
+    go l (SymbolicBuf b) = Just . into $ Prelude.max (unsafeInto . V.length $ b) l
     -- writes to a concrete index
     go l (WriteWord (Lit idx) _ b) = go (Prelude.max l (idx + 32)) b
     go l (WriteByte (Lit idx) _ b) = go (Prelude.max l (idx + 1)) b
@@ -550,6 +547,7 @@ slice offset size src = copySlice offset (Lit 0) size src mempty
 toList :: Expr Buf -> Maybe (V.Vector (Expr Byte))
 toList (AbstractBuf _) = Nothing
 toList (ConcreteBuf bs) = Just $ V.fromList $ LitByte <$> BS.unpack bs
+toList (SymbolicBuf bs) = Just bs
 toList buf = case bufLength buf of
   Lit l -> if l <= unsafeInto (maxBound :: Int)
               then Just $ V.generate (unsafeInto l) (\i -> readByte (Lit $ unsafeInto i) buf)
@@ -559,27 +557,11 @@ toList buf = case bufLength buf of
 fromList :: V.Vector (Expr Byte) -> Expr Buf
 fromList bs = case all isLitByte bs of
   True -> ConcreteBuf . vectorToByteString . VS.convert $ V.map getLitByte bs
-  -- we want to minimize the size of the resulting expression, so we do two passes:
-  --   1. write all concrete bytes to some base buffer
-  --   2. write all symbolic writes on top of this buffer
-  -- this is safe because each write in the input vec is to a single byte at a distinct location
-  -- runs in O(2n) time, and has pretty minimal allocation & copy overhead in
-  -- the concrete part (a single preallocated vec, with no copies)
-  False -> V.ifoldl' applySymWrites (ConcreteBuf concreteBytes) bs
+  False -> SymbolicBuf bs
   where
     getLitByte :: (Expr Byte) -> Word8
     getLitByte (LitByte w) = w
     getLitByte _ = internalError "Impossible!"
-
-    concreteBytes :: ByteString
-    concreteBytes = vectorToByteString $ VS.generate (V.length bs) (\idx ->
-      case bs V.! idx of
-        LitByte b -> b
-        _ -> 0)
-
-    applySymWrites :: Expr Buf -> Int -> Expr Byte -> Expr Buf
-    applySymWrites buf _ (LitByte _) = buf
-    applySymWrites buf idx by = WriteByte (Lit $ unsafeInto idx) by buf
 
 instance Semigroup (Expr Buf) where
   (ConcreteBuf a) <> (ConcreteBuf b) = ConcreteBuf $ a <> b
@@ -1047,6 +1029,8 @@ simplifyNoLitToKeccak e = untilFixpoint (mapExpr go) e
         in Lit (constructWord256 b)
 
     go (IndexWord a b) = indexWord a b
+    go (ByteAt a b) = byteAt a b
+    go (ReadBytes n a b) = readBytes n a b
 
 
     go (SEx a (SEx a2 b)) | a == a2  = sex a b
@@ -1666,6 +1650,12 @@ indexWord (Lit idx) (JoinBytes zero        one        two       three
 indexWord idx w = IndexWord idx w
 
 
+byteAt :: Expr EWord -> Expr EWord -> Expr EWord
+byteAt (Lit idx) (Lit w)
+  | idx <= 31 = Lit . fromIntegral $ shiftR w (248 - unsafeInto idx * 8)
+  | otherwise = Lit 0
+byteAt idx w = ByteAt idx w
+
 padByte :: Expr Byte -> Expr EWord
 padByte (LitByte b) = Lit . bytesToW256 $ [b]
 padByte b = joinBytes [b]
@@ -1884,11 +1874,6 @@ concKeccakSimpProps orig = untilFixpoint (simplifyProps . map (mapProp concKecca
 --            can be simplified into a concrete value
 -- Turns (Keccak ConcreteBuf) into a Lit
 concKeccakOnePass :: Expr a -> Expr a
-concKeccakOnePass (Keccak (ConcreteBuf bs)) = Lit (keccak' bs)
-concKeccakOnePass orig@(Keccak (CopySlice (Lit 0) (Lit 0) (Lit 64) orig2@(WriteWord (Lit 0) _ (ConcreteBuf bs)) (ConcreteBuf ""))) =
-  case (BS.length bs, (copySlice (Lit 0) (Lit 0) (Lit 64) (simplify orig2) (ConcreteBuf ""))) of
-    (64, ConcreteBuf a) -> Lit (keccak' a)
-    _ -> orig
 concKeccakOnePass x = x
 
 lhsConstHelper :: Expr a -> Maybe ()

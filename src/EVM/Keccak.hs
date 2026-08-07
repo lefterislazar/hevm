@@ -75,23 +75,10 @@ keccakAssumptions keccaks = injectivity <> minValue <> minDiffOfPairs
       minDistance _ = internalError "expected Keccak expression"
 
 concretizeKeccakParam :: Expr EWord -> Expr EWord
-concretizeKeccakParam (Keccak buf) = Keccak (concKeccakSimpExpr buf)
+concretizeKeccakParam (Keccak buf) = Keccak (simplify buf)
 concretizeKeccakParam _ = internalError "Cannot happen"
 
 
 type KeccakValue = (Expr Buf, W256)
 concreteKeccaks :: [Prop] -> Set KeccakValue
-concreteKeccaks ps = foldMap concreteKeccakProp ps
-  where
-  concreteKeccakProp :: Prop -> Set KeccakValue
-  concreteKeccakProp p = foldProp compute Set.empty p
-
-  compute :: forall a. Expr a -> Set KeccakValue
-  compute = \case
-    Keccak buf -> do
-      let b = concKeccakSimpExpr buf
-      case b of
-        buff@(ConcreteBuf bs) -> Set.singleton (buff, keccak' bs)
-        _ -> Set.empty
-    _ -> Set.empty
-
+concreteKeccaks _ = Set.empty

@@ -52,6 +52,7 @@ import Data.Text qualified as TS
 import Data.Text.Lazy qualified as T
 import Data.Text.Lazy.Builder
 import qualified Data.Text.Lazy.Builder.Int (decimal)
+import Data.Vector qualified as V
 import Language.SMT2.Parser (getValueRes, parseCommentFreeFileMsg, parseString, specConstant)
 import Language.SMT2.Syntax (Symbol, SpecConstant(..), GeneralRes(..), Term(..), QualIdentifier(..), Identifier(..), Sort(..), Index(..), VarBinding(..))
 import Numeric (readHex, readBin)
@@ -61,7 +62,7 @@ import EVM.Format (formatProp)
 import EVM.CSE
 import EVM.Expr (writeByte, bufLengthEnv, bufLength, minLength, inRange)
 import EVM.Expr qualified as Expr
-import EVM.Keccak (keccakAssumptions, concreteKeccaks, findKeccakPropsExprs)
+import EVM.Keccak (keccakAssumptions, findKeccakPropsExprs)
 import EVM.Traversals
 import EVM.Types
 import EVM.Effects
@@ -159,8 +160,8 @@ assertPropsHelper simp psPreConc = do
     (psElim, bufs, stores) = eliminateProps ps
 
     -- Props storing info that need declaration(s)
-    toDeclarePs     = ps <> keccAssump <> keccComp
-    toDeclarePsElim = psElim <> keccAssump <> keccComp
+    toDeclarePs     = ps <> keccAssump
+    toDeclarePsElim = psElim <> keccAssump
 
     -- vars, frames, and block contexts in need of declaration
     allVars = fmap referencedVars toDeclarePsElim <> fmap referencedVars bufVals <> fmap referencedVars storeVals
@@ -175,16 +176,12 @@ assertPropsHelper simp psPreConc = do
     abstractStores = Set.toList $ Set.unions (fmap referencedAbstractStores toDeclarePs)
     addresses = Set.toList $ Set.unions (fmap referencedAddrs toDeclarePs)
 
-    -- Keccak assertions: concrete values, distance between pairs, injectivity, etc.
-    --      This will make sure concrete values of Keccak are asserted, if they can be computed (i.e. can be concretized)
-    concreteKecc = concreteKeccaks psPreConc
-    allKeccaks = (findKeccakPropsExprs psElim bufVals storeVals) <> Set.map (Keccak . fst) concreteKecc
+    -- Keccak assertions: distance between pairs, injectivity, etc.
+    allKeccaks = findKeccakPropsExprs psElim bufVals storeVals
     keccAssump = keccakAssumptions $ Set.toList allKeccaks
-    keccComp = [(PEq (Lit l) (Keccak buf)) | (buf, l) <- Set.toList concreteKecc]
     keccakAssertions = do
       assumps <- mapM assertSMT keccAssump
-      comps <- mapM assertSMT keccComp
-      pure $ ((SMTComment "keccak assumptions") : assumps) <> ((SMTComment "keccak computations") : comps)
+      pure $ (SMTComment "keccak assumptions") : assumps
 
     -- assert that reads beyond size of buffer & storage is zero
     readAssumes = do
@@ -281,6 +278,7 @@ findBufferAccess = foldl' (foldTerm go) mempty
     go :: Expr a -> [(Expr EWord, Expr EWord, Expr Buf)]
     go = \case
       ReadWord idx buf -> [(idx, Lit 32, buf)]
+      ReadBytes n idx buf -> [(idx, Lit . unsafeInto $ Prelude.min 32 n, buf)]
       ReadByte idx buf -> [(idx, Lit 1, buf)]
       CopySlice srcOff _ size src _  -> [(srcOff, size, src)]
       _ -> mempty
@@ -324,6 +322,7 @@ discoverMaxReads props benv senv = bufMap
     baseBuf :: Expr Buf -> Expr Buf
     baseBuf (AbstractBuf b) = AbstractBuf b
     baseBuf (ConcreteBuf b) = ConcreteBuf b
+    baseBuf (SymbolicBuf b) = SymbolicBuf b
     baseBuf (GVar (BufVar a)) =
       case Map.lookup a benv of
         Just b -> baseBuf b
@@ -546,6 +545,13 @@ exprToSMT = \case
     pure $ "((_ zero_extend 96)" `sp` wa `sp` ")"
 
   LitByte b -> pure $ byteAsBV b
+  ByteAt idx w -> case idx of
+    Lit n -> if n >= 0 && n < 32
+             then do
+               enc <- exprToSMT w
+               pure $ "((_ zero_extend 248)" `sp` fromLazyText ("(indexWord" <> T.pack (show (into n :: Integer))) `sp` enc <> "))"
+             else exprToSMT (Lit 0)
+    _ -> op2 "byteAt" idx w
   IndexWord idx w -> case idx of
     Lit n -> if n >= 0 && n < 32
              then do
@@ -558,7 +564,9 @@ exprToSMT = \case
   ConcreteBuf "" -> pure "((as const Buf) #b00000000)"
   ConcreteBuf bs -> writeBytes bs mempty
   AbstractBuf s -> pure $ fromText s
+  SymbolicBuf bs -> writeSymbolicBytes bs mempty
   ReadWord idx prev -> op2 "readWord" idx prev
+  ReadBytes n idx prev -> concatBytes [Expr.readByte (Expr.add idx (Lit . unsafeInto $ i)) prev | i <- [0 .. Prelude.min 32 n - 1]]
   BufLength (AbstractBuf b) -> pure $ fromText b <> "_length"
   BufLength (GVar (BufVar n)) -> pure $ fromLazyText $ "buf" <> (T.pack . show $ n) <> "_length"
   BufLength b -> exprToSMT (bufLength b)
@@ -716,6 +724,17 @@ writeBytes bytes buf =  do
       else (idx', "(store " <> acc `sp` (wordAsBV idx) `sp` (byteAsBV byte) <> ")")
       where
         !idx' = idx + 1
+
+writeSymbolicBytes :: V.Vector (Expr Byte) -> Expr Buf -> Err Builder
+writeSymbolicBytes bytes buf = do
+  smtText <- exprToSMT buf
+  V.ifoldM wrap smtText bytes
+  where
+    wrap :: Builder -> Int -> Expr Byte -> Err Builder
+    wrap acc _ (LitByte 0) | buf == mempty = pure acc
+    wrap acc idx byte = do
+      byteSMT <- exprToSMT byte
+      pure $ "(store " <> acc `sp` wordAsBV idx `sp` byteSMT <> ")"
 
 encodeConcreteStore :: Map W256 W256 -> Err Builder
 encodeConcreteStore s = foldM encodeWrite ("((as const Storage) #x0000000000000000000000000000000000000000000000000000000000000000)") (Map.toList s)
